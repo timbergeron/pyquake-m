@@ -24,6 +24,7 @@ import enum
 import logging
 import socket
 import struct
+import sys
 
 
 logger = logging.getLogger(__name__)
@@ -63,7 +64,7 @@ class BadJoeQuakeVersion(DatagramError):
         self.supported_version = supported_version
 
 
-class _GenericUdpProtocol(asyncio.Protocol):
+class _GenericUdpProtocol(asyncio.DatagramProtocol):
     def __init__(self, loop):
         self._loop = loop
         self._connected_future = asyncio.Future()
@@ -78,7 +79,12 @@ class _GenericUdpProtocol(asyncio.Protocol):
         await self._connected_future
 
     def datagram_received(self, data, addr):
-        asyncio.ensure_future(self._recv_queue.put((data, addr)), loop=self._loop)
+        # Called in the event loop thread; safe to put_nowait
+        try:
+            self._recv_queue.put_nowait((data, addr))
+        except Exception:
+            # Fallback (should never hit)
+            asyncio.create_task(self._recv_queue.put((data, addr)))
         
     async def recvfrom(self):
         data, addr = await self._recv_queue.get()
@@ -94,6 +100,24 @@ class _GenericUdpProtocol(asyncio.Protocol):
         # Note: This is in _GenericUdpProtocol, but we need to notify the DatagramConnection
         # We can't directly access it here, so we'll let the disconnect() method handle this
         pass
+
+    # --- Windows Proactor: handle UDP socket errors gracefully ---
+    def error_received(self, exc):
+        # asyncio's Proactor UDP transport calls this on recv/send errors.
+        # Swallow common spurious errors (e.g., WinError 10022) and keep the transport alive.
+        try:
+            winerr = getattr(exc, "winerror", None)
+        except Exception:
+            winerr = None
+        # Ignore "An invalid argument was supplied" which can happen sporadically on UDP
+        if winerr == 10022:
+            logger.debug("UDP error_received ignored (WinError 10022): %r", exc)
+            return
+        # Log anything else but don't crash the loop
+        try:
+            logger.warning("UDP error_received: %r", exc)
+        except Exception:
+            pass
 
 
 def _raise_cb(fut):
@@ -213,9 +237,12 @@ class DatagramConnection:
     @classmethod
     async def connect(cls, host, port, joequake_version=None):
         loop = asyncio.get_running_loop()
+        # Bind explicitly; avoids WinSock quirks with unbound UDP + Proactor/Selector
         transport, protocol = await loop.create_datagram_endpoint(
-                lambda: _GenericUdpProtocol(loop),
-                family=socket.AF_INET)
+            lambda: _GenericUdpProtocol(loop),
+            family=socket.AF_INET,
+            local_addr=("0.0.0.0", 0)
+        )
 
         conn = cls(protocol)
         await conn._connect(host, port, joequake_version)

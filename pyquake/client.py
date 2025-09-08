@@ -42,6 +42,7 @@ import ipaddress
 # Optional line-editing/clipboard helpers for aliasedit
 try:
     import readline as _readline
+    import functools as _functools
 except Exception:
     _readline = None
 import json
@@ -57,6 +58,13 @@ from threading import Event
 import aiodgram
 import proto
 from typing import Union
+
+# --- Windows UDP reliability: use SelectorEventLoop instead of Proactor ---
+if sys.platform == "win32":
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    except Exception:
+        pass
 
 # --- Inline InfoString helpers (no separate module needed) ---
 def _strip_quotes(s: str) -> str:
@@ -265,6 +273,8 @@ class CvarSystem:
         self._userinfo_dirty = False
         self._serverinfo_dirty = False
         self._last_write_snapshot: dict[str, str] = {}
+        # CVARs we've retired and never want to (re)surface
+        self._retired: set[str] = {"sayrand_dir", "cl_chat_notify", "cl_chatinfo_mode"}
 
     @staticmethod
     def _canon(name: str) -> str: return name.lower()
@@ -275,6 +285,9 @@ class CvarSystem:
     def register(self, cvar: Cvar) -> bool:
         with self._lock:
             k = self._canon(cvar.name)
+            # Don't allow retired names to register
+            if k in self._retired:
+                return False
             if k in self._cvars:
                 print(f"Can't register variable {cvar.name}, already defined")
                 return False
@@ -293,6 +306,9 @@ class CvarSystem:
     def create(self, name: str, default_value: str, flags: CvarFlags = CvarFlags.NONE,
                cvar_type: CvarType = CvarType.FLOAT) -> Optional[Cvar]:
         with self._lock:
+            # Block creation of retired CVARs
+            if self._canon(name) in self._retired:
+                return None
             existing = self.find(name)
             if existing:
                 return existing
@@ -460,6 +476,9 @@ class CvarSystem:
             result = []
             # Iterate cvar VALUES and sort by name
             for cvar in sorted(self._cvars.values(), key=lambda c: c.name.lower()):
+                # Hide retired CVARs from the list
+                if self._canon(cvar.name) in self._retired:
+                    continue
                 name = cvar.name
                 if pattern and pattern not in name:
                     continue
@@ -515,16 +534,19 @@ class CvarSystem:
                         if len(parts) < 3:
                             continue
                         var_name = parts[1]
-                        # Skip retired variables so they don't get reintroduced.
-                        if var_name in ('cl_chat_notify', 'cl_chatinfo_mode'):
+                        # Skip (and actively remove) retired variables so they don't get reintroduced.
+                        if self._canon(var_name) in self._retired:
+                            # If it exists from a previous run, drop it.
+                            self.unregister_variable(var_name)
                             continue
                         var_value = ' '.join(parts[2:])
                     else:
                         if len(parts) < 2:
                             continue
                         var_name = parts[0]
-                        # Skip retired variables.
-                        if var_name in ('cl_chat_notify', 'cl_chatinfo_mode'):
+                        # Skip (and actively remove) retired variables.
+                        if self._canon(var_name) in self._retired:
+                            self.unregister_variable(var_name)
                             continue
                         var_value = ' '.join(parts[1:])
                     # shlex already removed quotes, so var_value is raw
@@ -606,9 +628,65 @@ class _ConsoleBuffer:
     def __init__(self):
         self.lines: list[str] = []
         self.backscroll: int = 0
+        # --- line-stitching state ---
+        self._line_open: bool = False         # currently appending a line to the terminal
+        self._pending_line: str = ""          # accumulated text for current line
+        self._stitch_last_at: float = 0.0     # last append time (monotonic)
+        self._stitch_timeout: float = 0.35    # seconds; finalize if idle gap exceeds this
+
+    def _finalize_line(self):
+        """Emit a newline if a stitched line is open, store it in history, and reset."""
+        if not self._line_open:
+            return
+        # Finish the terminal line
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+        # Remember it as a discrete console line
+        self.lines.append(self._pending_line)
+        # Reset state
+        self._pending_line = ""
+        self._line_open = False
+        self._stitch_last_at = 0.0
+
+    def newline(self):
+        """Public alias: finalize any stitched line."""
+        self._finalize_line()
+
+    def append(self, s: str, prefix: str = ""):
+        """
+        Append a chunk to the current console line without forcing a newline.
+        If no line is open, start one (optionally with a prefix, printed once).
+        Idle gaps > _stitch_timeout auto-finalize the previous line first.
+        """
+        if s is None:
+            return
+        s = str(s)
+        now = time.monotonic()
+        if self._line_open and now - self._stitch_last_at > self._stitch_timeout:
+            # Long gap → assume previous message completed
+            self._finalize_line()
+        if not self._line_open:
+            # Start a new visible line (emit prefix once)
+            if prefix:
+                sys.stdout.write(prefix)
+                self._pending_line = prefix
+            self._line_open = True
+        # Append the chunk verbatim (no extra spaces; we preserved them upstream)
+        sys.stdout.write(s)
+        sys.stdout.flush()
+        self._pending_line += s
+        self._stitch_last_at = now
 
     def write(self, s: str):
-        # Append to buffer then echo to terminal
+        # Suppress certain noisy diagnostics unless developer is enabled.
+        try:
+            if not _dev_enabled() and _is_dev_only_logline(s):
+                # Don't print or record to history when developer=0
+                return
+        except Exception:
+            pass
+        # If we're in the middle of a stitched line, close it before writing a full line
+        self._finalize_line()
         self.lines.append(s)
         print(s, flush=True)
 
@@ -616,6 +694,10 @@ class _ConsoleBuffer:
         # Equivalent spirit of: Q_memset(con_text,' ', con_buffersize); con_backscroll=0;
         self.lines.clear()
         self.backscroll = 0
+        # Reset any open stitched line
+        self._pending_line = ""
+        self._line_open = False
+        self._stitch_last_at = 0.0
         try:
             if os.name == "nt":
                 os.system("cls")
@@ -646,8 +728,9 @@ class _ConsoleBuffer:
                     break
             with open(path, "w", encoding="utf-8") as f:
                 for s in self.lines[start:]:
-                    # Trim trailing spaces; normalize quake 8-bit glyphs
-                    t = dequake_text((s or "").rstrip(" "))
+                    # Strip any ANSI color we added for the terminal first, then dequake.
+                    plain = strip_ansi((s or "")).rstrip(" ")
+                    t = dequake_text(plain)
                     # Write one line per entry; add newline if missing
                     if t.endswith("\n"):
                         f.write(t)
@@ -668,7 +751,116 @@ def DBG_ONCE(_key: str, _msg: str, _limit: int = 3) -> None:
     return
 # --- END TEMP DEBUG REMOVED ---
 
+# ---------------- Developer logging toggle (cvar: developer) ----------------
+def _ensure_developer_cvar() -> None:
+    """
+    Register a boolean 'developer' cvar if missing.
+      0 = suppress developer/info chatter (default)
+      1 = enable developer/info chatter (e.g., save/auto-save notes)
+    """
+    try:
+        if cvar_system.find("developer") is None:
+            cvar_system.register(Cvar(
+                "developer", "0",
+                flags=CvarFlags.ARCHIVE,
+                cvar_type=CvarType.BOOL,
+                description="Show developer/info messages in console (e.g., config save notes)."
+            ))
+    except Exception:
+        # cvar_system may not be initialized yet; that's ok.
+        pass
+
+def _dev_enabled() -> bool:
+    try:
+        return bool(cvar_system.get_bool("developer", False))
+    except Exception:
+        return False
+
+def _is_dev_only_logline(s: str) -> bool:
+    """
+    Returns True for noisy diagnostics we only want in developer mode.
+    Extend this with more substrings/patterns as needed.
+    """
+    # Normalize input and make checks case-insensitive
+    if isinstance(s, (bytes, bytearray)):
+        try:
+            s = s.decode("latin-1", "ignore")
+        except Exception:
+            s = str(s)
+    elif not isinstance(s, str):
+        s = str(s)
+    low = s.lower()
+
+    # Classic spammy/diagnostic lines
+    # Gate *any* variation (punctuation/case) of this string to developer=1
+    if "duplicate reliable message received" in low:
+        return True
+    # Treat config/apply chatter as developer-only
+    #   cfg: timelimit -> 10
+    #   after map cfg: deathmatch 1, timelimit 10, forceTL 0
+    #   config start: ...
+    #   config end: ...
+    # Allow an optional leading emoji/space (some paths prefix 💬).
+    if re.match(r'^\s*(?:💬\s*)?(?:cfg:|after(?:\s+map)?\s+cfg:|config(?:\s+(?:start|end))?:)', s, flags=re.IGNORECASE):
+        return True
+    # Exec noise while processing configs (only show to devs)
+    if IN_CFG_EXEC and re.match(r'^\s*(?:execing|couldn.?t\s+exec)\b', s, flags=re.IGNORECASE):
+        return True
+    return False
+
+# --- Global stdout filter so bare print() calls are also gated by developer ---
+class _DevFilterStdout:
+    def __init__(self, real):
+        self._real = real
+    def write(self, s):
+        try:
+            if (not _dev_enabled()) and _is_dev_only_logline(s):
+                return 0
+        except Exception:
+            # If anything goes wrong, fail open
+            pass
+        return self._real.write(s)
+    def writelines(self, lines):
+        for ln in lines:
+            self.write(ln)
+    def flush(self):
+        return self._real.flush()
+    # Pass through everything else (encoding, fileno, isatty, etc.)
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+# Install once
+try:
+    if not isinstance(sys.stdout, _DevFilterStdout):
+        sys.stdout = _DevFilterStdout(sys.stdout)
+    # Also filter stderr so prints/logging routed there are gated too
+    if not isinstance(sys.stderr, _DevFilterStdout):
+        sys.stderr = _DevFilterStdout(sys.stderr)
+except Exception:
+    pass
+
 logger = logging.getLogger()
+
+# --- Logging filter so library logs obey developer gating too ---
+class _DevLoggingFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+            if (not _dev_enabled()) and _is_dev_only_logline(msg):
+                return False
+        except Exception:
+            # Fail open if anything goes wrong
+            return True
+        return True
+
+# Attach once to the root logger (covers all handlers by default)
+try:
+    root = logging.getLogger()
+    # Avoid adding duplicates if module is reloaded
+    if not any(isinstance(f, _DevLoggingFilter) for f in getattr(root, "filters", [])):
+        root.addFilter(_DevLoggingFilter())
+except Exception:
+    pass
 
 _COLOR_DEBUG = False  # disable all color-debug prints
 _UCLR_RAW_DUMPS = 0  # limit raw dumps from UPDATECOLORS to avoid spam
@@ -682,7 +874,6 @@ DEFAULT_CFG: Optional[str] = None  # set to a string to embed a fallback default
 _EXTIP_CACHE: dict[str, Any] = {"ip": None, "at": 0.0}  # {"ip": "1.2.3.4", "at": monotonic}
 
 # --- say_random state ---
-_SAYRAND_DIR_CVAR = "sayrand_dir"
 _sayrand_loaded: list[bool] = [False]*10
 _sayrand_msgs: list[list[str]] = [[] for _ in range(10)]
 _sayrand_order: list[list[int]] = [[] for _ in range(10)]
@@ -720,6 +911,11 @@ def _kick_cbuf() -> None:
             # If there's a running loop, schedule the pump task on it.
             loop = asyncio.get_running_loop()
             loop.create_task(_cbuf_pump())
+            # ensure the idle reconnect loop is running on the same loop
+            try:
+                _ensure_idle_reconnect_task()
+            except Exception:
+                pass
         except RuntimeError:
             # No running loop → run synchronously so we don't get stuck busy.
             asyncio.run(_cbuf_pump())
@@ -769,10 +965,21 @@ async def _cbuf_pump() -> None:
                 if m2:
                     await _wait_next_frame(int(m2.group(1) or "1"))
                     continue
-                if CURRENT_CLIENT and CURRENT_CLIENT._alive and not CURRENT_CLIENT.disconnected:
-                    await CURRENT_CLIENT.send_command(c)
+                # Try to forward if we have a client and it's not explicitly disconnected.
+                if CURRENT_CLIENT and not CURRENT_CLIENT.disconnected:
+                    try:
+                        await CURRENT_CLIENT.send_command(c)
+                        continue
+                    except Exception:
+                        # fall through to local echo
+                        pass
+                # Offline (or race during connect): if this looks like plain chat,
+                # render a friendly local echo with our name; otherwise keep the
+                # old "(offline)" marker so scripts aren't silently dropped.
+                if not _is_raw_server_command(c):
+                    me = _sanitize_player_name(cvar_system.get_string("name", "player"))
+                    CON.write(f"{me}: {c}")
                 else:
-                    # Offline: treat as local echo so scripts don't vanish silently
                     CON.write(f"(offline) {c}")
     finally:
         _CBUF_BUSY = False
@@ -869,19 +1076,89 @@ def dequake_text(s) -> str:
         b = bytes(s)
     return b.translate(_DEQUAKE_TABLE).decode("latin-1", "ignore")
 
+# ---- ANSI helpers for console coloring ----
+# Matches ESC[ ... letter final (typical CSI SGR sequences)
+_ANSI_RE = re.compile(r'\x1b\[[0-9;?]*[ -/]*[@-~]')
+
+def strip_ansi(s: str) -> str:
+    if not isinstance(s, str):
+        try:
+            s = s.decode("latin-1", "ignore")
+        except Exception:
+            s = str(s)
+    return _ANSI_RE.sub("", s)
+
+ANSI_RED    = "\x1b[31m"
+ANSI_YELLOW = "\x1b[33m"
+ANSI_RESET  = "\x1b[0m"
+
+def _dequake_with_red(src: "str|bytes") -> str:
+    """
+    Render Quake text while coloring:
+      • high-bit masked bytes (>=128) as red
+      • 'gold number' bytes (base 18..27) as yellow
+    All bytes are still normalized through the DeQuake table.
+    """
+    if src is None:
+        return ""
+    b = src.encode("latin-1", "replace") if isinstance(src, str) else bytes(src)
+    out_parts = []
+    cur = None  # None | 'red' | 'yellow'
+    for ch in b:
+        base = ch % 128
+        is_gold   = 18 <= base <= 27              # QuakeC strings_ftos_gold
+        is_masked = (ch >= 128)
+        # Priority: gold (yellow) over masked (red)
+        want = 'yellow' if is_gold else ('red' if is_masked else None)
+        if want != cur:
+            if cur is not None:
+                out_parts.append(ANSI_RESET)
+            if want == 'red':
+                out_parts.append(ANSI_RED)
+            elif want == 'yellow':
+                out_parts.append(ANSI_YELLOW)
+            cur = want
+        mapped = _DEQUAKE_TABLE[ch]
+        out_parts.append(chr(mapped))
+    if cur is not None:
+        out_parts.append(ANSI_RESET)
+    return "".join(out_parts)
+
 # NetQuake uses '\b' (backspace) to flip color/bright in prints. Some servers
 # or proxies may also inject ^1/^2 style color codes. We just strip all that.
-_CHAT_RE = re.compile(r"^(?:\((?P<t>[^)]+)\)\s+)?(?P<nick>[^:]+):\s(?P<msg>.+)$")
+# Treat lines as chat only if they look like classic "(TEAM) nick: msg"
+# Allow leading spaces and dequaked '.'/'#' junk (some servers colorize with backspaces).
+_CHAT_RE = re.compile(r"^\s*[.#]*(?:\((?P<t>[^)]+)\)\s+)?(?P<nick>[^:]+)\s*:\s*(?P<msg>.+)$")
 
-def _strip_quake_colors(s: str) -> str:
+# Also accept team chat printed as ".(nick): msg"
+_CHAT_TEAM_ALT_RE = re.compile(r"^\s*[.#]*\((?P<nick>[^)]+)\)\s*:\s*(?P<msg>.+)$")
+
+def _strip_quake_colors(
+    s: str,
+    *,
+    colorize_masked_red: bool = True,
+    strip_ansi_codes: bool = False,
+) -> str:
+    """
+    Normalize Quake text for console display.
+      - When colorize_masked_red=True, bytes with high-bit set (>=128) are
+        shown as red ANSI while still dequaked to readable ASCII.
+      - Caret codes (^1,^m, etc) are stripped (add handling later if desired).
+      - Placeholder '#' introduced by dequaking control chars are removed.
+    """
     if not s:
         return s
-    # First: DeQuake mapping to normalize high/low control codes to ASCII.
-    s = dequake_text(s)
-    # Then remove common '^1' style color codes often injected by proxies.
-    s = re.sub(r"\^\d", "", s)
-    # Collapse weird CRLF combos or trailing spaces
-    return s.replace("\r", "").rstrip()
+    # Choose rendering path: color masked-red glyphs or plain dequake.
+    s = _dequake_with_red(s) if colorize_masked_red else dequake_text(s)
+    # Strip Quake-style caret color codes (digits or letters like ^m)
+    s = re.sub(r"\^[0-9a-z]", "", s, flags=re.IGNORECASE)
+    # Remove placeholder '#' produced by dequaking control bytes (e.g., backspace tricks)
+    s = re.sub(r"#+", "", s)
+    # Optionally remove any ANSI escape sequences completely.
+    if strip_ansi_codes:
+        s = strip_ansi(s)
+    # Preserve spaces exactly; just strip carriage returns.
+    return s.replace("\r", "")
 
 def _generate_random_bundle() -> str:
     """Generate a bundle of random results for f_random replies."""
@@ -925,7 +1202,8 @@ def _generate_random_bundle() -> str:
     return f"{coin}, {rps}, {color}, blackjack: {blackjack}, 1-100: {number}"
 
 def _display_server_print(raw: str) -> None:
-    txt = _strip_quake_colors(raw)
+    # Render text; by default masked-high-bit glyphs become red in the terminal.
+    txt = _strip_quake_colors(raw, colorize_masked_red=True)
     if not txt:
         return
     # During an internal ping sweep for 'showscores', swallow prints into a buffer
@@ -936,14 +1214,56 @@ def _display_server_print(raw: str) -> None:
         except Exception:
             pass
         return
-    m = _CHAT_RE.match(txt)
+    # Try both chat forms:
+    m  = _CHAT_RE.match(txt)              # "(TEAM) nick: msg" or "nick: msg"
+    m2 = _CHAT_TEAM_ALT_RE.match(txt)     # ".(nick): msg" or "(nick): msg"
+
+    # Alt team format: strip any leading '.' and render as "(nick): msg"
+    if m2:
+        nick = re.sub(r'^[.#]+', '', m2.group("nick"))
+        if _is_known_player_name(nick):
+            msg  = m2.group("msg")
+            CON.newline()
+            CON.write(f"({nick}): {msg}")
+            return
+        # else: fall through and treat as a normal server print (indented)
+
+    # Primary format: render exactly like server does (no special 'You:' label)
     if m:
-        # Team chat if "(TEAM) nick: msg" pattern; show a subtle tag.
         team = m.group("t")
-        prefix = "🟦 TEAM" if team else "💬"
-        CON.write(f"{prefix} {m.group('nick')}: {m.group('msg')}")
+        nick = re.sub(r'^[.#]+', '', m.group("nick"))
+        if _is_known_player_name(nick):
+            msg  = m.group("msg")
+            CON.newline()
+            if team:
+                CON.write(f"({team}) {nick}: {msg}")
+            else:
+                CON.write(f"{nick}: {msg}")
+            return
+        # else: not a known player → let it render as a normal server line
     else:
-        CON.write(f"ℹ️  {txt}")
+        # Non-chat server prints: stitch chunks into one visible line.
+        # Handle any embedded newlines explicitly.
+        parts = txt.split("\n")
+        for i, seg in enumerate(parts):
+            if seg:
+                # Hide dev-only chatter unless developer=1
+                try:
+                    if (not _dev_enabled()) and _is_dev_only_logline(seg):
+                        # Skip this segment entirely
+                        pass
+                    else:
+                        # Indent once at the start of a new stitched line
+                        CON.append(seg, prefix="  ")
+                except Exception:
+                    CON.append(seg, prefix="  ")
+            if i < len(parts) - 1:
+                # Explicit newline inside the payload: finalize the current line
+                CON.newline()
+        # Heuristic: if this chunk ends a sentence, finalize now so it doesn't
+        # wait for the next incoming print to show up as a line.
+        if re.search(r"[.!?]\s*$", txt):
+            CON.newline()
 
 def _strip_slash_command_name(cmd: str) -> str:
     """Servers may send commands prefixed with '//' (FTE compatibility). Normalize."""
@@ -959,7 +1279,8 @@ def _sanitize_player_name_full(s: str) -> str:
       - remove ASCII controls
       - trim and clamp to 31 visible chars
     """
-    s = _strip_quake_colors(s or "")
+    # For names/status we want *plain* text: no ANSI, no masked-red re-coloring.
+    s = _strip_quake_colors(s or "", colorize_masked_red=False, strip_ansi_codes=True)
     s = re.sub(r"[\x00-\x1F]", "", s).strip()
     if len(s) > 31:
         s = s[:31]
@@ -1057,12 +1378,13 @@ def _split_queued_commands(s: str) -> list[str]:
     return parts
 
 # Built-in client commands that shouldn't be shadowed; used for conflict rename.
-_RESERVED_CMDS = {
+_RESERVED_CMDS = frozenset({
     "help","cmdlist","aliaslist","clear","quit","disconnect","connect","reconnect","demo","kill","status",
-    "players","ping","impulse","name","color","say","say_team","tell","dm","pm","like",
+    "players","showscores","ping","impulse","name","color","say","say_team","tell","dm","pm","like",
     "condump","echo","exec","ip","extip","port","random",
     "reset","resetall","resetcfg","s","st","net_stats","unalias","unaliasall","wait",
     # say_random / say_rand slots (reserve so servers can't shadow)
+    "version",
     "say_rand0","say_rand1","say_rand2","say_rand3","say_rand4",
     "say_rand5","say_rand6","say_rand7","say_rand8","say_rand9",
     "say_random0","say_random1","say_random2","say_random3","say_random4",
@@ -1073,7 +1395,7 @@ _RESERVED_CMDS = {
     "infotest",
     # cvar-related builtins
     "set","seta","unset","toggle","cvarlist","writeconfig","execconfig"
-}
+})
 
 # Only treat these server STUFFCMD impulses as pings we should echo.
 # (ClanRing uses 39. Add others if you really need them.)
@@ -1082,6 +1404,181 @@ ALLOWED_STUFFCMD_IMPULSES: set[int] = {39}
 # --- ChatInfo flags (match engine) ---
 CIF_CHAT = 1 << 0
 CIF_AFK  = 1 << 1
+
+# ============================== TAB COMPLETION ==============================
+_TABCOMP_CACHE: dict[str, list[str]] = {}   # simple per-buffer cache for current request
+
+def _rl_is_libedit() -> bool:
+    try:
+        return "libedit" in (_readline.__doc__ or "").lower()
+    except Exception:
+        return False
+
+def _tabcomp__all_command_names() -> list[str]:
+    """
+    Union of built-in/reserved command names and anything registered via cvar_system.register_command().
+    """
+    names = set()
+    try:
+        names.update(_RESERVED_CMDS)
+    except Exception:
+        pass
+    try:
+        # cvar_system keeps commands under canonical (lowercased) keys
+        for k in getattr(cvar_system, "_commands", {}).keys():
+            names.add(k)
+    except Exception:
+        pass
+    return sorted(names)
+
+def _tabcomp__all_cvar_names() -> list[str]:
+    """
+    All CVAR names plus their CVAR-alias names (cvar_system.register_alias).
+    """
+    out = set()
+    try:
+        for cv in getattr(cvar_system, "_cvars", {}).values():
+            out.add(cv.name)
+        for a in getattr(cvar_system, "_aliases", {}).keys():
+            out.add(a)
+    except Exception:
+        pass
+    return sorted(out, key=str.lower)
+
+def _tabcomp__all_alias_names() -> list[str]:
+    """
+    Server/local aliases captured on CURRENT_CLIENT (exact keys as shown by aliaslist).
+    """
+    try:
+        if CURRENT_CLIENT and getattr(CURRENT_CLIENT, "aliases", None):
+            return sorted(list(CURRENT_CLIENT.aliases.keys()), key=str.lower)
+    except Exception:
+        pass
+    return []
+
+def _startswith_ci(hay: str, needle: str) -> bool:
+    return hay.casefold().startswith((needle or "").casefold())
+
+def _tabcomp_candidates(prefix: str, *, mode: str, first_token: str|None) -> list[str]:
+    """
+    mode:
+      - "root": first token completion -> commands ∪ cvars ∪ aliases
+      - "cvar": second token completion for set/seta/toggle/reset/unset -> cvars
+      - "alias": second token completion for alias/unalias/aliasedit -> aliases
+    """
+    if mode == "cvar":
+        pool = _tabcomp__all_cvar_names()
+    elif mode == "alias":
+        pool = _tabcomp__all_alias_names()
+    else:
+        # root
+        pool = []
+        pool.extend(_tabcomp__all_command_names())
+        pool.extend(_tabcomp__all_cvar_names())
+        # prefer alias names last so commands/cvars appear first in duplicates
+        alias_names = _tabcomp__all_alias_names()
+        # De-dup while preserving earlier items' order
+        seen = set()
+        merged = []
+        for name in pool + alias_names:
+            k = name.casefold()
+            if k not in seen:
+                seen.add(k)
+                merged.append(name)
+        pool = merged
+    # Filter by prefix (case-insensitive)
+    return [n for n in pool if _startswith_ci(n, prefix)]
+
+def _tabcomp_mode_for_line(tokens: list[str]) -> str:
+    """
+    Decide which domain to complete based on the first token.
+    """
+    if not tokens:
+        return "root"
+    t0 = tokens[0].casefold()
+    if t0 in ("set", "seta", "toggle", "reset", "unset"):
+        return "cvar"
+    if t0 in ("alias", "unalias", "aliasedit"):
+        return "alias"
+    return "root"
+
+def _clean_prompt_lead(buf: str) -> str:
+    # Our UI sometimes prints ']' before the cursor; ignore it for parsing.
+    # Only strip a single leading ']' so legit ']' in the command stays.
+    if buf.startswith("]"):
+        return buf[1:]
+    return buf
+
+def _tab_completer(text: str, state: int):
+    """
+    GNU readline-compatible completer:
+      - complete only "words" separated by spaces/semicolons
+      - first token: commands ∪ cvars ∪ aliases
+      - 2nd token on set/seta/toggle/reset/unset: cvars
+      - 2nd token on alias/unalias/aliasedit: alias names
+    """
+    try:
+        buf = _readline.get_line_buffer()
+    except Exception:
+        buf = ""
+    buf = _clean_prompt_lead(buf)
+
+    # Compute the current tokens *up to* the cursor position.
+    try:
+        beg = _readline.get_begidx()
+    except Exception:
+        beg = len(buf) - len(text)
+    line_up_to_cursor = buf[:beg]
+    # Split naively on whitespace (aliases are single bare names, fine)
+    tokens = [t for t in re.split(r"\s+", line_up_to_cursor.strip()) if t]
+    mode = _tabcomp_mode_for_line(tokens)
+
+    # The prefix being completed is 'text'. Build cache key from context.
+    key = f"{mode}|{text}|{buf}|{beg}"
+    if state == 0 or key not in _TABCOMP_CACHE:
+        # When completing the second argument after e.g. 'set ', drop the first token from tokens.
+        prefix = text or ""
+        cand = _tabcomp_candidates(prefix, mode=mode, first_token=(tokens[0] if tokens else None))
+        # Sort with a mild heuristic: shorter first, then lexicographic (case-insensitive)
+        cand.sort(key=lambda s: (len(s), s.lower()))
+        _TABCOMP_CACHE.clear()
+        _TABCOMP_CACHE[key] = cand
+    lst = _TABCOMP_CACHE.get(key, [])
+    return lst[state] if 0 <= state < len(lst) else None
+
+def _install_tab_completion() -> None:
+    """
+    Best-effort install of readline completion:
+      - binds Tab for GNU readline
+      - for libedit (macOS default), uses 'bind ^I rl_complete'
+      - keeps delimiter set minimal so we complete tokens split by spaces/semicolons
+    """
+    if not _readline:
+        return
+    try:
+        # Make ';' a delimiter so "cmd1; c<TAB>" completes the next token properly.
+        _readline.set_completer_delims(" \t\n;")
+    except Exception:
+        pass
+    try:
+        if _rl_is_libedit():
+            _readline.parse_and_bind("bind ^I rl_complete")
+        else:
+            _readline.parse_and_bind("tab: complete")
+    except Exception:
+        # Non-fatal
+        pass
+    try:
+        _readline.set_completer(_tab_completer)
+    except Exception:
+        pass
+
+# Install tab completion early (safe to run multiple times)
+try:
+    _install_tab_completion()
+except Exception:
+    pass
+# ============================ END TAB COMPLETION ============================
 
 # --- Console typing & idle tracking (no-OS, flicker-free) ---
 _INPUT_ACTIVE = Event()           # True while input() is waiting
@@ -1096,6 +1593,63 @@ def _mark_activity():
 # can forward updates to the server without plumbing it everywhere.
 CURRENT_CLIENT = None  # type: Optional["AsyncClient"]
 
+# ======================= Connection timeouts (CVARs) =======================
+def _ensure_timeout_cvars() -> None:
+    """
+    Register connection timeout CVARs if missing.
+      net_connecttimeout   : seconds to wait for initial connect/handshake (default 10)
+      net_messagetimeout   : seconds without any server message before timing out (default 300)
+    """
+    try:
+        if cvar_system.find("net_connecttimeout") is None:
+            cvar_system.register(Cvar(
+                "net_connecttimeout", "10",
+                flags=CvarFlags.ARCHIVE,
+                cvar_type=CvarType.FLOAT,
+                minimum=1.0, maximum=120.0,
+                description="Seconds to wait for initial connect/handshake before failing."
+            ))
+        if cvar_system.find("net_messagetimeout") is None:
+            cvar_system.register(Cvar(
+                "net_messagetimeout", "300",
+                flags=CvarFlags.ARCHIVE,
+                cvar_type=CvarType.FLOAT,
+                minimum=10.0, maximum=1800.0,
+                description="Seconds of silence from the server before closing the connection."
+            ))
+    except Exception:
+        pass
+
+# Ensure timeout CVARs exist at import time too
+try:
+    _ensure_timeout_cvars()
+except Exception:
+    pass
+
+# ================= Immediate UDP error surfacing helpers ==================
+def _enable_windows_udp_connreset(sock) -> None:
+    """
+    On Windows, make UDP report ICMP 'port unreachable' as WSAECONNRESET (10054).
+    That gives us the 'instant' disconnect behavior like classic Quake.
+    (If you set this to 0 you *suppress* the error; we explicitly enable it.)
+    """
+    try:
+        if os.name != "nt":
+            return
+        # SIO_UDP_CONNRESET = _WSAIOW(IOC_VENDOR,12) = 0x9800000C
+        SIO_UDP_CONNRESET = 0x9800000C
+        # 1 → enable error reporting; 0 would suppress it
+        sock.ioctl(SIO_UDP_CONNRESET, struct.pack("I", 1))
+    except Exception:
+        # If this fails, watchdog still covers us; don't crash
+        pass
+
+def _now_monotonic() -> float:
+    try:
+        return time.monotonic()
+    except Exception:
+        return time.time()
+
 # -------------------- Config auto-save (no CVARs) --------------------
 def _autosave_config(silent: bool = False):
     """
@@ -1105,11 +1659,17 @@ def _autosave_config(silent: bool = False):
     Args:
         silent: If True, don't print success/failure messages
     """
+    # Ensure the toggle exists before checking it
+    _ensure_developer_cvar()
     try:
         # Prefer the system's configured default; fall back to 'config.cfg'
         path = getattr(cvar_system, "_config_file", "config.cfg")
         ok = cvar_system.write_variables(path)  # same as write_variables() with default
-        if not silent:
+
+        # Respect both the explicit 'silent' arg and the 'developer' toggle.
+        quiet = bool(silent) or (not _dev_enabled())
+
+        if not quiet:
             if ok:
                 print(f"💾 Config saved to {path}")
             else:
@@ -1118,12 +1678,20 @@ def _autosave_config(silent: bool = False):
         # cvar_system not available
         pass
     except Exception as e:
-        if not silent:
+        # Only emit the error if developer chatter is enabled and not explicitly silenced
+        if not silent and _dev_enabled():
             print(f"⚠️  Autosave error: {e}")
 
 def _set_current_client(c: "AsyncClient|None") -> None:
     global CURRENT_CLIENT
     CURRENT_CLIENT = c
+    try:
+        _ensure_cl_idle_cvar()
+        _ensure_timeout_cvars()
+        _IDLE_RECONNECT.on_client_changed()
+        _ensure_idle_reconnect_task()
+    except Exception:
+        pass
 
 def _sanitize_player_name(s: str) -> str:
     """
@@ -1142,6 +1710,26 @@ def _sanitize_player_name(s: str) -> str:
 def _name_key(s: str) -> str:
     """Canonical key for merging/lookup: sanitized 15-char name, case-insensitive."""
     return _sanitize_player_name(s).casefold()
+
+def _is_known_player_name(nick: str) -> bool:
+    """Check if a nickname is a known player (or the local player)."""
+    if not nick:
+        return False
+
+    # Check against local player name
+    me_name = _sanitize_player_name(cvar_system.get_string("name", ""))
+    if _name_key(nick) == _name_key(me_name):
+        return True
+
+    # Check against server-known players (if we have a client)
+    if CURRENT_CLIENT and hasattr(CURRENT_CLIENT, '_players'):
+        nick_key = _name_key(nick)
+        for player in CURRENT_CLIENT._players.values():
+            player_name = getattr(player, 'name', '')
+            if _name_key(player_name) == nick_key:
+                return True
+
+    return False
 
 def _clamp_color(n: int) -> int:
     # Classic engines typically accept 0..13; some allow up to 15.
@@ -1724,6 +2312,7 @@ def _print_cmdlist():
     print("\nCommands:")
     print("  (chat)              - Just type and press Enter to chat")
     print("  help                - Show this command list")
+    print("  version             - Show client version tag")
     print("  echo <text>         - Print text locally")
     print("  ip [ext|local]      - Show external or local IP")
     print("  port [n]            - Show/set default server port (for connect)")
@@ -1766,6 +2355,135 @@ def _print_cmdlist():
     print("")
     print("  infotest            - TEMP: dump a few info keys from server/my/user caches")
 
+# ====================== cl_idle (auto reconnect) =======================
+def _ensure_cl_idle_cvar() -> None:
+    """
+    Register cl_idle if missing.
+      0 = disabled (default)
+      N = minutes between reconnect attempts while disconnected (clamped 1–60)
+    """
+    try:
+        cv = cvar_system.find("cl_idle")
+        if cv is None:
+            cvar_system.register(Cvar(
+                "cl_idle", "0",
+                flags=CvarFlags.ARCHIVE,
+                cvar_type=CvarType.INT,
+                minimum=0, maximum=60,
+                description="When >0, auto-reconnect every N minutes while disconnected (clamped 1–60)."
+            ))
+    except Exception:
+        pass
+
+class _IdleReconnectManager:
+    """
+    Watches cl_idle and connection state; when disconnected and cl_idle>0,
+    attempts an immediate 'reconnect' and then retries every N minutes
+    (N clamped to 1..60). Messages go through CON and commands via Cbuf_AddText.
+    """
+    def __init__(self):
+        self._task: asyncio.Task | None = None
+        self._last_attempt: float = 0.0
+        self._saw_dc: bool = False
+
+    def ensure_task(self):
+        # start the loop once per process on the active asyncio loop
+        if self._task and not self._task.done():
+            return
+        loop = asyncio.get_running_loop()
+        self._task = loop.create_task(self._loop(), name="idle-reconnect")
+
+    def on_client_changed(self):
+        # reset state so a fresh immediate attempt will happen after a dc
+        self._last_attempt = 0.0
+        self._saw_dc = False
+
+    def reset_timer(self):
+        # called when cl_idle changes to re-arm promptly
+        self._last_attempt = 0.0
+
+    async def _loop(self):
+        while True:
+            try:
+                _ensure_cl_idle_cvar()
+                minutes = int(cvar_system.get_value("cl_idle", 0))
+            except Exception:
+                minutes = 0
+
+            if minutes <= 0:
+                # disabled; idle a bit
+                self._saw_dc = False
+                self._last_attempt = 0.0
+                await asyncio.sleep(5.0)
+                continue
+
+            # clamp 1..60 to avoid spam
+            clamped = max(1, min(60, int(minutes)))
+            interval = clamped * 60.0
+            now = time.monotonic()
+
+            dc = (CURRENT_CLIENT is None) or bool(getattr(CURRENT_CLIENT, "disconnected", True))
+            if dc:
+                # first notice of being disconnected → attempt immediately
+                if not self._saw_dc:
+                    self._saw_dc = True
+                    self._last_attempt = 0.0
+                if self._last_attempt == 0.0:
+                    CON.write(f"attempting reconnect... will retry every {clamped} {'minute' if clamped==1 else 'minutes'}")
+                    Cbuf_AddText("reconnect\n")
+                    self._last_attempt = now
+                elif (now - self._last_attempt) >= interval:
+                    CON.write(f"idle reconnect triggered after {clamped} {'minute' if clamped==1 else 'minutes'}")
+                    Cbuf_AddText("reconnect\n")
+                    self._last_attempt = now
+            else:
+                # connected → clear flags so next dc gets an immediate attempt
+                self._saw_dc = False
+                self._last_attempt = 0.0
+
+            await asyncio.sleep(1.0)
+
+_IDLE_RECONNECT = _IdleReconnectManager()
+
+def _ensure_idle_reconnect_task():
+    try:
+        _IDLE_RECONNECT.ensure_task()
+    except RuntimeError:
+        # no running loop yet; it will be started the next time a loop exists
+        pass
+
+def _invoke_alias_if_any(raw: str) -> bool:
+    """
+    If `raw` is exactly the name of a known alias, queue its body into the
+    command buffer and return True. Uses same conflict handling as unalias:
+    exact match, then '<name>_a' for reserved collisions, then case-insensitive.
+    """
+    if not CURRENT_CLIENT:
+        return False
+    name = (raw or "").strip()
+    if not name or (" " in name):
+        return False  # only bare single tokens invoke aliases, Quake-style
+    aliases = getattr(CURRENT_CLIENT, "aliases", None) or {}
+    key = None
+    if name in aliases:
+        key = name
+    elif name.lower() in _RESERVED_CMDS and (name + "_a") in aliases:
+        key = name + "_a"
+    else:
+        # case-insensitive fallback
+        for k in aliases.keys():
+            if k.lower() == name.lower():
+                key = k
+                break
+    if key is None:
+        return False
+    body = (aliases.get(key) or "").strip()
+    if not body:
+        return True  # alias exists but empty; still "handled"
+    # Queue the alias body so ';' and 'wait' behave correctly
+    Cbuf_InsertText(body)
+    return True
+
 def _handle_local_command(line: str) -> bool:
     """Return True if we handled it locally (and nothing should be sent to server)."""
     raw = (line or "").strip()
@@ -1773,6 +2491,11 @@ def _handle_local_command(line: str) -> bool:
         DBG("input: <empty>")
         return True
     DBG(f"input: {raw!r}")
+
+    # --- single-token alias invocation (e.g., "last") ---
+    # Do this early so aliases behave like in classic engines.
+    if CURRENT_CLIENT and _invoke_alias_if_any(raw):
+        return True
 
     low = raw.lower()
     # --- info extensions from server (and for manual testing) ---
@@ -1784,6 +2507,20 @@ def _handle_local_command(line: str) -> bool:
     # --- semi-colon batching: run via command buffer so 'wait' works in one-liners ---
     if (";" in raw) or ("\n" in raw):
         Cbuf_AddText(raw)
+        return True
+
+    # --- cmd <args> : forward args to server (strip the "cmd ") ---
+    # This makes aliases like  alias last "cmd last"  work reliably.
+    m_cmd = re.match(r'(?i)^\s*cmd\s+(.+?)\s*$', raw)
+    if m_cmd:
+        args = m_cmd.group(1)
+        if CURRENT_CLIENT and CURRENT_CLIENT._alive and not CURRENT_CLIENT.disconnected:
+            try:
+                asyncio.create_task(CURRENT_CLIENT.send_command(args))
+            except Exception:
+                pass
+        else:
+            CON.write(f"(offline) {args}")
         return True
 
     # --- wait [n]: mark to defer remainder (handled by cbuf, but keep for direct calls) ---
@@ -1873,7 +2610,6 @@ def _handle_local_command(line: str) -> bool:
         idx = int(m_srand.group(1))
         rest = (m_srand.group(2) or "").strip()
         team = rest.lower() in ("team", "-t")
-        _ensure_sayrand_cvars()
         _sayrand_ensure_loaded(idx)
         if not _sayrand_msgs[idx]:
             CON.write(f"no messages found for msgrand{idx}.txt")
@@ -1890,9 +2626,29 @@ def _handle_local_command(line: str) -> bool:
             cmd = "say_team" if team else "say"
             asyncio.create_task(CURRENT_CLIENT.send_command(f"{cmd} {pick}"))
         else:
-            prefix = "🟦" if team else "💬"
+            prefix = "👪" if team else "💬"
             CON.write(f"{prefix} {pick}")
         return True
+
+    # --- say/say_team usage (no args) ---
+    # 'say' / 'say_team' with no args -> show usage like s/st
+    m_say = re.match(r'(?i)^\s*say(?:\s+(.*))?$', raw)
+    if m_say:
+        msg = (m_say.group(1) or "").strip()
+        if not msg:
+            CON.write("usage:\n  say <message>\n")
+            return True
+        # have an arg → let normal path forward to server
+        return False
+
+    m_sayteam = re.match(r'(?i)^\s*say_team(?:\s+(.*))?$', raw)
+    if m_sayteam:
+        msg = (m_sayteam.group(1) or "").strip()
+        if not msg:
+            CON.write("usage:\n  say_team <message>\n")
+            return True
+        # have an arg → let normal path forward to server
+        return False
 
     # --- chat shortcuts ---
     # s <msg>  → say <msg>
@@ -1905,7 +2661,7 @@ def _handle_local_command(line: str) -> bool:
         if CURRENT_CLIENT and CURRENT_CLIENT._alive and not CURRENT_CLIENT.disconnected:
             asyncio.create_task(CURRENT_CLIENT.send_command(f"say {msg}"))
         else:
-            CON.write(f"💬 {msg}")
+            CON.write(f"💬 You: {msg}")
         return True
 
     # st <msg> → say_team <msg>
@@ -1918,7 +2674,7 @@ def _handle_local_command(line: str) -> bool:
         if CURRENT_CLIENT and CURRENT_CLIENT._alive and not CURRENT_CLIENT.disconnected:
             asyncio.create_task(CURRENT_CLIENT.send_command(f"say_team {msg}"))
         else:
-            CON.write(f"🟦 {msg}")  # local hint for team chat
+            CON.write(f"👪 TEAM • You: {msg}")
         return True
 
     # --- reset <cvar>: reset to default (johnfitz) ---
@@ -2155,6 +2911,11 @@ def _handle_local_command(line: str) -> bool:
         _print_cmdlist()
         return True
 
+    # --- version: print client version tag ---
+    if low == "version":
+        CON.write(CLIENT_VER)
+        return True
+
     # rcon <args...>  -> uses rcon_password cvar
     m = re.match(r"(?i)^rcon(?:\s+(.*))?$", raw)
     if m and CURRENT_CLIENT:
@@ -2365,22 +3126,22 @@ def _ensure_net_hostport_cvar() -> None:
         pass
 
 # -------------------- say_random helpers --------------------
-def _ensure_sayrand_cvars() -> None:
-    """Create 'sayrand_dir' cvar if missing (where msgrand#.txt are read from)."""
+def _sayrand_base_dir() -> str:
+    """
+    Use the same directory as config.cfg.
+    - If cvar_system._config_file is absolute, use its parent.
+    - If it's relative (default "config.cfg"), use the current working directory.
+    """
     try:
-        if cvar_system.find(_SAYRAND_DIR_CVAR) is None:
-            cvar_system.register(Cvar(
-                _SAYRAND_DIR_CVAR, ".",
-                flags=CvarFlags.ARCHIVE,
-                cvar_type=CvarType.STRING,
-                description="Directory containing msgrand0..9.txt for say_rand"
-            ))
+        cfg = getattr(cvar_system, "_config_file", "config.cfg") or "config.cfg"
+        if os.path.isabs(cfg):
+            return os.path.dirname(cfg) or os.getcwd()
+        return os.getcwd()
     except Exception:
-        pass
+        return os.getcwd()
 
 def _sayrand_path(slot: int) -> str:
-    base = cvar_system.get_string(_SAYRAND_DIR_CVAR, ".") or "."
-    return os.path.join(os.path.expanduser(base), f"msgrand{slot}.txt")
+    return os.path.join(_sayrand_base_dir(), f"msgrand{slot}.txt")
 
 def _sayrand_ensure_loaded(slot: int) -> None:
     """Lazy-load msgrand{slot}.txt into memory once."""
@@ -3125,6 +3886,11 @@ class AsyncClient:
         return maybe
 
     async def send_reliable_raw(self, payload: bytes):
+        # If we're offline (or transport is gone), do nothing.
+        if self.disconnected or not self._alive:
+            return
+        if not hasattr(self._conn, "send_reliable"):
+            return
         await self._maybe_await(self._conn.send_reliable(payload))
         self.last_tx_at = time.monotonic()
         # Count packet/message/bytes
@@ -3467,9 +4233,11 @@ class AsyncClient:
                     # Auto-save on map change: any new SERVERINFO with a different level
                     try:
                         if self.level_name and parsed.level_name and parsed.level_name != self.level_name:
-                            _autosave_config()
-                            try: CON.write(f"💾 Auto-saved config (map change: {self.level_name} → {parsed.level_name})")
-                            except Exception: pass
+                            # autosave on map change; only *announce* when developer=1
+                            _autosave_config(silent=True)
+                            if _dev_enabled():
+                                try: CON.write(f"💾 Auto-saved config (map change: {self.level_name} → {parsed.level_name})")
+                                except Exception: pass
                     except Exception: pass
                     # Reset centerprint dedupe on new level/serverinfo.
                     self._last_centerprint_logged = None
@@ -3872,6 +4640,10 @@ class AsyncClient:
                     await self._send_heartbeat(impulse=imp, reliable=True)
         except Exception:
             pass
+        # Bail out if offline to avoid waiting on an ACK that will never arrive.
+        if self.disconnected or not self._alive:
+            return
+        # Normal path when connected.
         await self.send_reliable_raw(_make_cmd_body(cmd))
 
     # ---- CVAR <-> network integration ----
@@ -4122,6 +4894,27 @@ def _maybe_self_bottom(client: "AsyncClient", name_k: str) -> int | None:
     try:
         me = _name_key(cvar_system.get_string("name", "pyquake-m"))
         if name_k == me:
+            # Prefer server-reflected myinfo (most accurate)
+            try:
+                bc = _safe_int(client.myinfo_get("bottomcolor", ""))
+                if bc is not None:
+                    return bc & 15
+            except Exception:
+                pass
+            # Fallback: packed fields if present
+            try:
+                cm = _safe_int(client.myinfo_get("colormap", ""))
+                if cm is not None and cm >= 16:
+                    return cm & 15
+            except Exception:
+                pass
+            try:
+                colors = _safe_int(client.myinfo_get("colors", ""))
+                if colors is not None:
+                    return colors & 15
+            except Exception:
+                pass
+            # Final fallback: local CVAR
             return _clamp_color(int(cvar_system.get_value("bottomcolor", 0)))
     except Exception:
         pass
@@ -4844,9 +5637,12 @@ async def _aioclient():
                             guard_task = None
                         # Auto-save before tearing down the connection
                         try:
-                            _autosave_config()
-                            try: CON.write("💾 Auto-saved config (manual disconnect).")
-                            except Exception: pass
+                            # Always autosave, but only *announce* it when developer=1
+                            # (keep the config write quiet so we fully control the message here)
+                            _autosave_config(silent=True)
+                            if _dev_enabled():
+                                try: CON.write("💾 Auto-saved config (manual disconnect).")
+                                except Exception: pass
                         except Exception: pass
                         _set_current_client(None)
                         try:
@@ -5079,19 +5875,31 @@ async def _aioclient():
                                 said = re.sub(r"^say\s+", "", raw, flags=re.IGNORECASE)
                             except Exception:
                                 said = raw
-                            CON.write(f"💬 You: {said}")
+                            #CON.write(f"💬 You: {said}")
                         elif re.match(r"^say_team\s+(.+)$", raw, flags=re.IGNORECASE):
                             await client.send_command(raw)
                             try:
                                 said = re.sub(r"^say_team\s+", "", raw, flags=re.IGNORECASE)
                             except Exception:
                                 said = raw
-                            CON.write(f"🟦 TEAM • You: {said}")
+                            #CON.write(f"👪 TEAM • You: {said}")
                         else:
                             await client.send_command(raw)
                     else:
-                        # Default to chat
-                        await client.send_command(f"say {line}")
+                        # Only send to server when actually connected.
+                        if CURRENT_CLIENT and CURRENT_CLIENT._alive and not CURRENT_CLIENT.disconnected:
+                            # If the line looks like a real server command, forward it verbatim;
+                            # otherwise treat it as chat.
+                            if _is_raw_server_command(line):
+                                await client.send_command(line)
+                            else:
+                                await client.send_command(f"say {line}")
+                        else:
+                            # Disconnected: never try to send; just echo locally so the console
+                            # doesn't break on unknown input while offline.
+                            if line.strip():
+                                CON.write(f"(offline) {line}")
+                            # (nothing else to do in offline mode)
 
             except KeyboardInterrupt:
                 print("\nDisconnecting...")
