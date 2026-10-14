@@ -1,3 +1,4 @@
+import io
 import math
 import struct
 import unittest
@@ -53,6 +54,34 @@ class ProtocolTests(unittest.TestCase):
         message, _ = proto.ServerMessage.parse_message(b"\x03" + struct.pack("<Bi", 0, -10), NQ)
         self.assertEqual(message.value, -10)
 
+    def test_standard_control_messages_preserve_following_data(self):
+        message, rest = proto.ServerMessage.parse_message(
+            b"\x10" + struct.pack("<H", (5000 << 3) | 3) + b"\x01", NQ)
+        self.assertEqual((message.entity_num, message.channel), (5000, 3))
+        self.assertEqual(rest, b"\x01")
+        message, rest = proto.ServerMessage.parse_message(b"\x21\x01", NQ)
+        self.assertEqual(message.msg_type, proto.ServerMessageType.SELLSCREEN)
+        self.assertEqual(rest, b"\x01")
+        for version in proto.ProtocolVersion:
+            with self.subTest(version=version):
+                message, rest = proto.ServerMessage.parse_message(
+                    b"\x04" + struct.pack("<I", version) + b"\x01", NQ)
+                self.assertEqual(message.protocol.version, version)
+                self.assertEqual(rest, b"\x01")
+        with self.assertRaises(proto.UnsupportedProtocol):
+            proto.ServerMessage.parse_message(b"\x04" + struct.pack("<I", 1234), NQ)
+
+    def test_version_message_preserves_rmq_flags(self):
+        protocol = proto.Protocol(proto.ProtocolVersion.RMQ, proto.ProtocolFlags.FLOATCOORD)
+        message, _ = proto.ServerMessage.parse_message(b"\x04" + struct.pack("<I", 999), protocol)
+        self.assertEqual(message.protocol, protocol)
+
+    def test_demo_can_select_protocol_with_version_message(self):
+        payload = b"\x04" + struct.pack("<I", 666) + b"\x25sky\0"
+        demo = io.BytesIO(b"-1\n" + struct.pack("<Ifff", len(payload), 0, 0, 0) + payload)
+        messages = list(proto.read_demo_file(demo))
+        self.assertEqual(messages[-1][2].string, "sky")
+
     def test_signed_client_data(self):
         flags = (proto._ClientDataFlags.VIEWHEIGHT | proto._ClientDataFlags.IDEALPITCH
                  | proto._ClientDataFlags.PUNCH1 | proto._ClientDataFlags.PUNCH2
@@ -89,7 +118,7 @@ class ProtocolTests(unittest.TestCase):
         self.assertLessEqual(len(proto.ServerMessageUpdate._msg_cache), 4096)
 
     def test_truncated_messages_raise_protocol_error(self):
-        for packet in (b"", b"\x07", b"\x82", b"\x0d", b"\x06\x18"):
+        for packet in (b"", b"\x07", b"\x82", b"\x0d", b"\x06\x18", b"\x04\0", b"\x10\0"):
             with self.subTest(packet=packet), self.assertRaises(proto.MalformedNetworkData):
                 proto.ServerMessage.parse_message(packet, FQ)
 

@@ -22,8 +22,14 @@
 import asyncio
 import enum
 import logging
+import re
 import socket
 import struct
+
+if __package__:
+    from .checksum import block_checksum
+else:
+    from checksum import block_checksum
 
 
 logger = logging.getLogger(__name__)
@@ -33,6 +39,24 @@ _MAX_DATAGRAM_BODY = 32000
 _CONNECT_TIMEOUT = 10.0
 _ACK_TIMEOUT = 1.0
 _RELIABLE_ATTEMPTS = 10
+_MOD_PROQUAKE = 1
+_PROQUAKE_VERSION = 35
+_PQF_CHEATFREE = 0x01
+_PQF_IGNOREPORT = 0x80
+
+
+def _proquake_password(password: str) -> int:
+    """Match QSS-M's strtol(base=0), or hash the complete password string."""
+    if password in ("", "none"):
+        return 0
+    match = re.fullmatch(r"[ \t\n\r\v\f]*([+-]?)(0[xX][0-9a-fA-F]+|0[0-7]*|[1-9][0-9]*)",
+                         password)
+    if match:
+        sign, digits = match.groups()
+        base = 16 if digits.lower().startswith("0x") else 8 if digits.startswith("0") else 10
+        value = int(digits, base)
+        return (-value if sign == "-" else value) & 0xffffffff
+    return block_checksum(password.encode("utf-8"))
 
 
 class _NetFlags(enum.IntFlag):
@@ -140,6 +164,9 @@ class DatagramConnection:
         self._udp._connection_lost_callback = self.connection_lost
 
         self.joequake_version = None
+        self.proquake_angle_hack = False
+        self.proquake_version = None
+        self.proquake_flags = 0
 
     def connection_lost(self, exc):
         if self._closing:
@@ -172,14 +199,12 @@ class DatagramConnection:
                           self._send_reliable_ack_queue.qsize(),
                           self._message_queue.qsize())
 
-    def _make_connection_request_body(self, joequake_version):
-        if joequake_version is None:
-            return b'\x01QUAKE\x00\x03'
-        else:
-            return (b'\x01QUAKE\x00\x03\x01' +
-                    bytes([joequake_version, 0, 0, 0, 0, 0]))
+    def _make_connection_request_body(self, joequake_version=None, *, password=""):
+        version = _PROQUAKE_VERSION if joequake_version is None else joequake_version
+        return b'\x01QUAKE\x00\x03' + struct.pack(
+            "<BBBI", _MOD_PROQUAKE, version, 0, _proquake_password(password))
 
-    async def _connect(self, host, port, desired_joequake_version=None):
+    async def _connect(self, host, port, desired_joequake_version=None, *, password=""):
         loop = asyncio.get_running_loop()
         addresses = await loop.getaddrinfo(host, port, family=socket.AF_INET,
                                           type=socket.SOCK_DGRAM)
@@ -191,7 +216,7 @@ class DatagramConnection:
         response_received = False
         while not response_received:
             logger.info("Sending connection request...")
-            body = self._make_connection_request_body(desired_joequake_version)
+            body = self._make_connection_request_body(desired_joequake_version, password=password)
             header_fmt = ">HH"
             header_size = struct.calcsize(header_fmt)
             header = struct.pack(header_fmt, _NetFlags.CTL, len(body) + header_size)
@@ -226,21 +251,31 @@ class DatagramConnection:
             raise DatagramError(f"Expected CCREP_ACCEPT message, not {body[0]}")
         if len(body) < 5:
             raise DatagramError("Truncated CCREP_ACCEPT message")
-        self._port, = struct.unpack("<L", body[1:5])
-        if not 1 <= self._port <= 65535:
-            raise DatagramError(f"Invalid server port: {self._port}")
-        self._host = host
-
+        server_port, = struct.unpack("<L", body[1:5])
+        mod = body[5] if len(body) > 5 else 0
+        mod_version = body[6] if len(body) > 6 else 0
+        mod_flags = body[7] if len(body) > 7 else 0
         if len(body) > 5:
-            mod_version = body[6] if len(body) > 6 else 0
-            mod_flags = body[7] if len(body) > 7 else 0
             logger.info("Server mod: 0x%x, version: 0x%x, flags: 0x%x",
-                        body[5], mod_version, mod_flags)
-            if (desired_joequake_version is not None and
-                    mod_version != desired_joequake_version):
-                raise BadJoeQuakeVersion(mod_version, desired_joequake_version)
-        elif desired_joequake_version is not None:
-            raise BadJoeQuakeVersion(None, desired_joequake_version)
+                        mod, mod_version, mod_flags)
+        if mod == _MOD_PROQUAKE:
+            if mod_flags & _PQF_CHEATFREE:
+                raise DatagramError("Server requires unsupported ProQuake cheat-free authentication")
+            self.proquake_angle_hack = True
+            self.proquake_version = mod_version
+            self.proquake_flags = mod_flags
+            if mod_flags & _PQF_IGNOREPORT:
+                server_port = port
+        if desired_joequake_version is not None and (
+                mod != _MOD_PROQUAKE or mod_version != desired_joequake_version):
+            raise BadJoeQuakeVersion(mod_version if mod == _MOD_PROQUAKE else None,
+                                     desired_joequake_version)
+        # A zero port means to keep using the original destination, as in QSS-M.
+        if server_port == 0:
+            server_port = port
+        if not 1 <= server_port <= 65535:
+            raise DatagramError(f"Invalid server port: {server_port}")
+        self._host, self._port = host, server_port
         self.joequake_version = desired_joequake_version
 
         logger.info("Connection Accepted")
@@ -254,7 +289,7 @@ class DatagramConnection:
             task.add_done_callback(self._task_done)
 
     @classmethod
-    async def connect(cls, host, port, joequake_version=None):
+    async def connect(cls, host, port, joequake_version=None, *, password=""):
         loop = asyncio.get_running_loop()
         # Bind explicitly; avoids WinSock quirks with unbound UDP + Proactor/Selector
         transport, protocol = await loop.create_datagram_endpoint(
@@ -265,7 +300,7 @@ class DatagramConnection:
 
         conn = cls(protocol)
         try:
-            await asyncio.wait_for(conn._connect(host, port, joequake_version),
+            await asyncio.wait_for(conn._connect(host, port, joequake_version, password=password),
                                    _CONNECT_TIMEOUT)
         except asyncio.TimeoutError as exc:
             conn.connection_lost(exc)

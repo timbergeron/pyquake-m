@@ -148,6 +148,81 @@ class HandshakeTests(unittest.IsolatedAsyncioTestCase):
         resolver.start()
         self.addCleanup(resolver.stop)
 
+    async def accept(self, trailer=b"", *, server_port=26001, password="", desired_version=None):
+        udp = FakeUdp()
+        udp.incoming.put_nowait((control(b"\x81" + struct.pack("<I", server_port) + trailer),
+                                ("127.0.0.1", 26000)))
+        conn = aiodgram.DatagramConnection(udp)
+
+        async def close():
+            conn.disconnect()
+            await conn.wait_until_disconnected()
+
+        self.addAsyncCleanup(close)
+        await conn._connect("localhost", 26000, desired_version, password=password)
+        request, address = await asyncio.wait_for(udp.outgoing.get(), 1)
+        self.assertEqual(address, ("127.0.0.1", 26000))
+        return conn, request
+
+    async def test_proquake_accept_and_password_request(self):
+        conn, request = await self.accept(b"\x01\x23\x00", password="password")
+        self.assertEqual(request, control(b"\x01QUAKE\0\x03\x01\x23\0\xd4\x0a\x67\xe4"))
+        self.assertTrue(conn.proquake_angle_hack)
+        self.assertEqual(conn.proquake_version, 35)
+        self.assertIsNone(conn.joequake_version)
+        conn.send(b"\x01")
+        data, address = await asyncio.wait_for(conn._udp.outgoing.get(), 1)
+        self.assertEqual(address, ADDRESS)
+        self.assertEqual(data, packet(aiodgram._NetFlags.UNRELIABLE, 0, b"\x01"))
+
+    async def test_vanilla_and_foreign_mods_do_not_negotiate_proquake(self):
+        for trailer in (b"", b"\0", b"\x02\x23\x81"):
+            with self.subTest(trailer=trailer):
+                conn, _ = await self.accept(trailer)
+                self.assertFalse(conn.proquake_angle_hack)
+                self.assertIsNone(conn.proquake_version)
+                self.assertEqual((conn._host, conn._port), ADDRESS)
+
+    async def test_ignoreport_keeps_original_destination(self):
+        for advertised_port in (0, 26099, 0xffffffff):
+            with self.subTest(advertised_port=advertised_port):
+                conn, _ = await self.accept(b"\x01\x23\x80", server_port=advertised_port)
+                self.assertEqual(conn.proquake_flags, 0x80)
+                self.assertEqual(conn._port, 26000)
+                conn.send(b"\x01")
+                _, address = await asyncio.wait_for(conn._udp.outgoing.get(), 1)
+                self.assertEqual(address, ("127.0.0.1", 26000))
+
+    async def test_zero_port_keeps_original_destination(self):
+        conn, _ = await self.accept(server_port=0)
+        self.assertEqual(conn._port, 26000)
+
+    async def test_invalid_port_is_rejected_without_ignoreport(self):
+        with self.assertRaisesRegex(aiodgram.DatagramError, "Invalid server port"):
+            await self.accept(b"\x01\x23\0", server_port=65536)
+
+    async def test_cheatfree_accept_is_rejected(self):
+        with self.assertRaisesRegex(aiodgram.DatagramError, "cheat-free"):
+            await self.accept(b"\x01\x23\x01")
+
+    async def test_joequake_version_option_still_requires_matching_proquake_mod(self):
+        conn, request = await self.accept(b"\x01\x04\0", desired_version=4)
+        self.assertTrue(conn.proquake_angle_hack)
+        self.assertEqual(conn.joequake_version, 4)
+        self.assertEqual(request, control(b"\x01QUAKE\0\x03\x01\x04\0\0\0\0\0"))
+        for trailer in (b"", b"\x01\x23\0", b"\x02\x04\0"):
+            with self.subTest(trailer=trailer), self.assertRaises(aiodgram.BadJoeQuakeVersion):
+                await self.accept(trailer, desired_version=4)
+
+    async def test_public_connect_passes_password_to_handshake(self):
+        loop = asyncio.get_running_loop()
+        with mock.patch.object(loop, "create_datagram_endpoint", new=mock.AsyncMock(
+                return_value=(self.udp._transport, self.udp))), \
+                mock.patch.object(aiodgram.DatagramConnection, "_connect", new=mock.AsyncMock()) as connect:
+            conn = await aiodgram.DatagramConnection.connect("localhost", 26000, password="1234")
+        connect.assert_awaited_once_with("localhost", 26000, None, password="1234")
+        conn.disconnect()
+
     async def test_rejection_reports_server_reason(self):
         self.udp.incoming.put_nowait((control(b"\x82Server is full\0"), ("127.0.0.1", 26000)))
         conn = aiodgram.DatagramConnection(self.udp)

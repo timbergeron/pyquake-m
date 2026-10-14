@@ -588,6 +588,38 @@ class ServerMessageNop(NoFieldsServerMessage):
 
 
 @_register_server_message
+class ServerMessageVersion(ServerMessage):
+    field_names = ('protocol',)
+    msg_type = ServerMessageType.VERSION
+
+    @classmethod
+    def parse(cls, m, protocol):
+        (version,), m = cls._parse_struct("<I", m)
+        try:
+            version = ProtocolVersion(version)
+        except ValueError as exc:
+            raise UnsupportedProtocol(f"Unsupported protocol: {version}") from exc
+        flags = protocol.flags if protocol is not None and protocol.version == version else ProtocolFlags(0)
+        return cls(Protocol(version, flags)), m
+
+
+@_register_server_message
+class ServerMessageStopSound(ServerMessage):
+    field_names = ('entity_num', 'channel')
+    msg_type = ServerMessageType.STOPSOUND
+
+    @classmethod
+    def parse(cls, m, protocol):
+        (channel,), m = cls._parse_struct("<H", m)
+        return cls(channel >> 3, channel & 7), m
+
+
+@_register_server_message
+class ServerMessageSellScreen(NoFieldsServerMessage):
+    msg_type = ServerMessageType.SELLSCREEN
+
+
+@_register_server_message
 class ServerMessageFoundSecret(NoFieldsServerMessage):
     msg_type = ServerMessageType.FOUNDSECRET
 
@@ -1148,7 +1180,7 @@ def read_demo_file(f):
         msg = _read(f, msg_len)
         while msg:
             parsed, msg = ServerMessage.parse_message(msg, protocol)
-            if parsed.msg_type == ServerMessageType.SERVERINFO:
+            if parsed.msg_type in (ServerMessageType.SERVERINFO, ServerMessageType.VERSION):
                 protocol = parsed.protocol
             yield not bool(msg), view_angles, parsed
 

@@ -121,6 +121,111 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.client.entities[1].origin, (1, 2, 3))
         self.assertEqual(self.client.entities[1].model_num, 3)
 
+    async def receive(self, packet):
+        waiting = asyncio.create_task(self.client.wait_for_center_print())
+        await asyncio.sleep(0)
+        self.conn.incoming.put_nowait(packet + b"\x1acheckpoint\0")
+        await asyncio.wait_for(waiting, 1)
+
+    async def test_live_frags_reach_scoreboard_and_team_totals(self):
+        await self.receive(b"\x0d\x02player\0\x11\x02\x04"
+                           + b"\x0e" + struct.pack("<Bh", 2, -5))
+        self.assertEqual(self.client._score_state[2]["frags"], -5)
+        self.assertEqual(self.client._derive_team_frags_from_players(), {4: -5})
+        await self.receive(b"\x0e" + struct.pack("<Bh", 2, 12))
+        self.assertEqual(self.client._score_state[2]["frags"], 12)
+
+    async def test_departed_player_does_not_survive_in_ping_or_userinfo_caches(self):
+        await self.receive(b"\x0d\x02old\0\x11\x02\x04")
+        self.client._score_state[2].update(ping=42, frags=8)
+        self.client._latest_ping_by_name["old"] = 42
+        await self.receive(b"\x0d\x02\0")
+        self.assertFalse(self.client._score_state[2]["active"])
+        self.assertNotIn("old", self.client._latest_ping_by_name)
+        self.assertNotIn(2, self.client._userinfo_is)
+        await self.receive(b"\x0d\x02new\0")
+        self.assertNotIn("ping", self.client._score_state[2])
+        self.assertNotIn("frags", self.client._score_state[2])
+        self.assertEqual(self.client.userinfo_get(2, "name"), "new")
+
+    async def test_received_info_extensions_update_caches(self):
+        commands = ('//fullserverinfo "\\hostname\\Test server\\timelimit\\10"\n'
+                    'svi "matchtime" "3:42"\n'
+                    'cmd fui 2 "\\name\\player\\bottomcolor\\4"\n'
+                    '//ui 2 "bottomcolor" "13"\n')
+        await self.receive(b"\x09" + commands.encode("latin-1") + b"\0")
+        self.assertEqual(self.client.serverinfo_get("hostname"), "Test server")
+        self.assertEqual(self.client.serverinfo_get("matchtime"), "3:42")
+        self.assertEqual(self.client.userinfo_get(2, "name"), "player")
+        self.assertEqual(self.client.userinfo_get(2, "bottomcolor"), "13")
+        self.assertEqual(self.client._score_state[2]["bottomcolor"], 13)
+        await self.receive(b'\x09fullserverinfo ""\n\0')
+        self.assertFalse(self.client._serverinfo_is)
+
+    async def test_synthesized_userinfo_tracks_changes_and_yields_to_real_info(self):
+        await self.receive(b"\x0d\x02old\0\x11\x02\x34")
+        self.assertEqual(self.client.userinfo_get(2, "name"), "old")
+        self.assertEqual(self.client.userinfo_get(2, "topcolor"), "3")
+        await self.receive(b"\x0d\x02new\0\x11\x02\x5d")
+        self.assertEqual(self.client.userinfo_get(2, "name"), "new")
+        self.assertEqual(self.client.userinfo_get(2, "topcolor"), "5")
+        self.assertEqual(self.client.userinfo_get(2, "bottomcolor"), "13")
+        await self.receive(b'\x09ui 2 "name" "server name"\n\0')
+        await self.receive(b"\x0d\x02changed\0")
+        self.assertEqual(self.client.userinfo_get(2, "name"), "server name")
+
+    async def test_entity_colormap_does_not_override_player_colors(self):
+        baseline = (b"\x16" + struct.pack("<HBBBB", 20, 0, 0, 20, 0)
+                    + struct.pack("<hBhBhB", 0, 0, 0, 0, 0, 0))
+        # Both a baseline before the name and one after UPDATECOLORS must be safe.
+        await self.receive(baseline + b"\x0d\x13player\0")
+        self.assertNotIn("bottomcolor", self.client._score_state[19])
+        await self.receive(b"\x11\x13\x5d" + baseline + b"\x81\x08\x14\x14")
+        self.assertEqual(self.client._score_state[19]["bottomcolor"], 13)
+        self.assertEqual(self.client.userinfo_get(19, "topcolor"), "5")
+        self.assertEqual(self.client.userinfo_get(19, "bottomcolor"), "13")
+
+    async def test_standard_control_messages_do_not_stop_reader(self):
+        await self.receive(b"\x04" + struct.pack("<I", 666)
+                           + b"\x10" + struct.pack("<H", (10 << 3) | 2) + b"\x21")
+        self.assertEqual(self.client.protocol.version, proto.ProtocolVersion.FITZQUAKE)
+        self.assertFalse(self.client._read_task.done())
+
+    async def test_unreliable_stats_count_successful_send(self):
+        await self.client._send_unreliable(b"\x01")
+        self.assertEqual(self.client._net_stats["unreliable_messages_sent"], 1)
+        self.assertEqual(self.client._net_stats["packets_sent"], 1)
+        self.assertEqual(self.client._net_stats["bytes_sent"], 1)
+
+    async def test_reliable_fallback_stats_are_not_counted_twice(self):
+        transport = mock.Mock(spec=["send_reliable"])
+        transport.send_reliable = mock.AsyncMock()
+        with mock.patch.object(self.client, "_conn", transport):
+            await self.client._send_unreliable(b"\x01")
+        self.assertEqual(self.client._net_stats["reliable_messages_sent"], 1)
+        self.assertEqual(self.client._net_stats["packets_sent"], 1)
+        self.assertEqual(self.client._net_stats["bytes_sent"], 1)
+
+    async def test_failed_send_does_not_update_stats_or_last_tx(self):
+        last_tx = self.client.last_tx_at
+        with mock.patch.object(self.conn, "send", side_effect=OSError("closed")):
+            with self.assertRaises(OSError):
+                await self.client._send_unreliable(b"\x01")
+        self.assertEqual(self.client.last_tx_at, last_tx)
+        self.assertEqual(self.client._net_stats["packets_sent"], 0)
+
+    async def test_ping_results_are_independent_of_print_chunk_boundaries(self):
+        self.client._score_state[2] = {"active": True, "name": "player"}
+        for name in ("player", client.ANSI_RED + "player" + client.ANSI_RESET):
+            stream = f"Client ping times:\n  42 {name}\n  70 other\n"
+            for size in (1, 7, len(stream)):
+                with self.subTest(name=name, size=size):
+                    self.client._latest_ping_by_name.clear()
+                    chunks = [stream[i:i + size] for i in range(0, len(stream), size)]
+                    self.client._update_pings_from_lines(chunks)
+                    self.assertEqual(self.client._latest_ping_by_name, {"player": 42, "other": 70})
+                    self.assertEqual(self.client._score_state[2]["ping"], 42)
+
     async def test_userinfo_changes_and_resets_reach_server_and_unsubscribe(self):
         cv = client.Cvar("team", "red", client.CvarFlags.USERINFO, cvar_type=client.CvarType.STRING)
         self.cvars.register(cv)
@@ -229,7 +334,225 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(client.cvar_system._listeners)
 
 
+def pq_byte(value):
+    return bytes((16 + ((value >> 4) & 15), 16 + (value & 15)))
+
+
+def pq_message(command, args=b"", suffix=b""):
+    return b"\x09\x01" + bytes((command,)) + args + suffix + b"\0"
+
+
+class ProQuakeTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.cvars = client.CvarSystem()
+        for name, value in (("cvar_system", self.cvars), ("CURRENT_CLIENT", None),
+                            ("CON", mock.Mock())):
+            patcher = mock.patch.object(client, name, value, create=True)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.conn = FakeConnection()
+        self.client = client.AsyncClient(self.conn)
+        self.client._read_task = asyncio.create_task(self.client._read_messages())
+        self.client._read_task.add_done_callback(self.client._reader_finished)
+
+    async def asyncTearDown(self):
+        await self.client.disconnect()
+
+    async def receive(self, message):
+        waiting = asyncio.create_task(self.client.wait_for_center_print())
+        await asyncio.sleep(0)
+        self.conn.incoming.put_nowait(message + b"\x1aprocessed\0")
+        await asyncio.wait_for(waiting, 1)
+
+    async def print_message(self, text):
+        await self.receive(b"\x08" + text.encode("latin-1") + b"\0")
+
+    async def timer(self, minutes, seconds):
+        await self.receive(pq_message(5, pq_byte(minutes) + pq_byte(seconds)))
+
+    async def test_team_scores_signed_frags_and_lifecycle(self):
+        await self.receive(pq_message(2, b"\x14\x14") + pq_message(2, b"\x1d\x1d"))
+        for score in (42, -3, -32768, 32767):
+            with self.subTest(score=score):
+                await self.receive(pq_message(4, b"\x14" + pq_byte(score >> 8) + pq_byte(score)))
+                self.assertEqual(self.client._pq_team_frags[4], score)
+        await self.receive(pq_message(1))
+        self.assertEqual(self.client._pq_team_frags, {4: 32767, 13: 0})
+        await self.receive(pq_message(2, b"\x14\x13"))
+        self.assertEqual(self.client._pq_team_frags[4], 0)
+        self.assertEqual(self.client._pq_team_colors[4], 16 * 3 + 4)
+        await self.receive(pq_message(3, b"\x14"))
+        self.assertEqual(self.client._pq_team_frags, {13: 0})
+        self.assertNotIn(4, self.client._pq_team_colors)
+        await self.receive(pq_message(6))
+        self.assertFalse(self.client._pq_team_frags)
+        self.assertFalse(self.client._pq_team_colors)
+
+    async def test_nop_does_not_enable_teamgame(self):
+        await self.receive(pq_message(1))
+        self.assertFalse(self.client._pq_teamgame_hint)
+
+    async def test_binary_prefix_preserves_following_text_and_message_alignment(self):
+        await self.receive(pq_message(2, b"\x14\x14", b"cmd ping\n")
+                           + pq_message(4, b"\x14" + pq_byte(0) + pq_byte(42),
+                                        b'alias watch "cmd observe"\n'))
+        self.assertIn(b"\x04ping\0", self.conn.sent)
+        self.assertEqual(self.client.aliases["watch"], "cmd observe")
+        self.assertEqual(self.client._pq_team_frags[4], 42)
+
+    async def test_malformed_and_unknown_payloads_do_not_change_state_or_execute_text(self):
+        self.client.time = 100
+        await self.timer(10, 0)
+        await self.receive(pq_message(2, b"\x14\x14"))
+        malformed = (b"\x09\x01\0", pq_message(2), pq_message(3),
+                     pq_message(4, b"\x14\x10\x10"),
+                     pq_message(4, b"\x14\x10\x10\x10\x20"),
+                     pq_message(5, b"\x10\x10\x10"),
+                     pq_message(5, b"\x10\x10\x10\x20"),
+                     pq_message(2, b"\x1e\x14"), pq_message(3, b"\x1f"),
+                     pq_message(2, b"\x14\x20"),
+                     pq_message(99, b"\x14\x14", b"cmd ping\n"))
+        with self.assertLogs(client.logger, level="WARNING"):
+            await self.receive(b"".join(malformed))
+        self.assertEqual(self.client._pq_team_frags, {4: 0})
+        self.assertEqual(self.client._pq_team_colors, {4: 68})
+        self.assertEqual(self.client._current_match_time(), (10, 0))
+        self.assertNotIn(b"\x04ping\0", self.conn.sent)
+        self.assertFalse(self.client._read_task.done())
+
+    async def test_pause_freezes_current_time_and_resume_excludes_pause_duration(self):
+        self.client.time = 100
+        await self.timer(10, 0)
+        self.client.time = 110
+        await self.print_message("Match paused\n")
+        self.assertEqual(self.client._current_match_time(), (9, 50))
+        self.client.time = 120
+        await self.print_message("Match paused\n")  # Repeated notification is harmless.
+        self.assertEqual(self.client._current_match_time(), (9, 50))
+        self.client.time = 130
+        await self.print_message("Match unpaused\n")
+        self.assertEqual(self.client._current_match_time(), (9, 50))
+        self.client.time = 131
+        await self.print_message("Match unpaused\n")
+        self.assertEqual(self.client._current_match_time(), (9, 49))
+
+    async def test_timer_sample_while_paused_remains_frozen(self):
+        self.client.time = 100
+        await self.timer(10, 0)
+        self.client.time = 110
+        await self.print_message("Match paused\n")
+        self.client.time = 120
+        await self.timer(9, 50)
+        self.client.time = 140
+        self.assertTrue(self.client._pq_paused)
+        self.assertEqual(self.client._current_match_time(), (9, 50))
+        await self.print_message("Match unpaused\n")
+        self.client.time = 141
+        self.assertEqual(self.client._current_match_time(), (9, 49))
+
+    async def test_fractional_seconds_do_not_tick_early_and_clock_clamps_at_zero(self):
+        self.client.time = 100
+        await self.timer(0, 1)
+        self.client.time = 100.9
+        self.assertEqual(self.client._current_match_time(), (0, 1))
+        self.client.time = 101
+        self.assertEqual(self.client._current_match_time(), (0, 0))
+        self.client.time = 200
+        self.assertEqual(self.client._current_match_time(), (0, 0))
+
+    async def test_monotonic_sample_does_not_switch_clock_source_during_signon(self):
+        with mock.patch.object(self.client, "_mono_now", return_value=10) as now:
+            await self.timer(10, 0)
+            self.client.time = 1000
+            now.return_value = 11
+            self.assertEqual(self.client._current_match_time(), (9, 59))
+            await self.timer(9, 59)
+            self.client.time = 1001
+            self.assertEqual(self.client._current_match_time(), (9, 58))
+
+    async def test_printed_minutes_support_both_forms_and_ignore_chat_or_seconds(self):
+        self.client.time = 100
+        for text, minutes in (("5 minutes remaining\n", 5),
+                              ("Match ends in 7 minutes remaining\n", 7),
+                              ("Match ends in 3 minutes\n", 3), ("1 minute remaining\n", 1)):
+            with self.subTest(text=text):
+                await self.print_message(text)
+                self.assertEqual(self.client._current_match_time(), (minutes, 0))
+        await self.print_message("player: 5 minutes remaining\n")
+        await self.print_message("Match ends in 4 seconds remaining\n")
+        self.assertEqual(self.client._current_match_time(), (1, 0))
+
+    async def test_timer_sentinels_negative_countdown_and_hidden_fallback(self):
+        self.client.time = 100
+        self.client._serverinfo_is["matchtime"] = "10"
+        self.assertIn("10:00", self.client.format_showscores_footer())
+        for minutes, seconds, display in ((254, 0, "SD"), (0, 128, "-0:00"),
+                                          (0, 133, "-0:05"), (0, 187, "-0:59")):
+            with self.subTest(minutes=minutes, seconds=seconds):
+                await self.timer(minutes, seconds)
+                self.assertIn(display, self.client.format_showscores_footer())
+        for seconds in (0, 255):
+            await self.timer(255, seconds)
+            self.assertIsNone(self.client._current_match_time())
+            self.assertEqual(self.client.format_showscores_footer().strip(), "No Teams")
+
+    async def test_match_end_and_map_change_clear_paused_clock(self):
+        self.client.time = 100
+        await self.timer(10, 0)
+        await self.print_message("Match paused\n")
+        await self.print_message("The match is over\n")
+        self.assertFalse(self.client._pq_paused)
+        self.assertIsNone(self.client._pq_pause_time)
+        self.assertIsNone(self.client._current_match_time())
+        await self.print_message("Match paused\n")
+        await self.receive(server_info())
+        self.assertFalse(self.client._pq_paused)
+        self.assertIsNone(self.client._pq_pause_time)
+        self.assertIsNone(self.client._pq_minutes)
+        self.assertFalse(self.client._pq_uses_server_time)
+
+    async def test_move_angles_follow_negotiation_or_extended_protocol(self):
+        self.client.time = 10
+        for negotiated, version, fmt, angles in (
+                (False, 15, "<BfBBBhhhBB", (0, 64, 192)),
+                (True, 15, "<BfHHHhhhBB", (64, 16384, 49152)),
+                (False, 666, "<BfHHHhhhBB", (64, 16384, 49152))):
+            with self.subTest(negotiated=negotiated, version=version):
+                self.conn.proquake_angle_hack = negotiated
+                self.client.protocol = proto.Protocol(proto.ProtocolVersion(version), proto.ProtocolFlags(0))
+                self.conn.sent.clear()
+                self.client.move(math.pi / 512, math.pi / 2, -math.pi / 2, 1, -2, 3, 4, 5)
+                await asyncio.sleep(0)
+                self.assertEqual(struct.unpack(fmt, self.conn.sent[-1]),
+                                 (3, 10, *angles, 1, -2, 3, 4, 5))
+                await self.client._small_move_unreliable()
+                await self.client._small_move_reliable()
+                await self.client._send_heartbeat(impulse=39)
+                for move in self.conn.sent[1:]:
+                    self.assertEqual(struct.unpack(fmt, move)[2:5], angles)
+
+    async def test_client_passes_cvar_or_explicit_password_before_reading_messages(self):
+        self.cvars.register(client.Cvar("password", "configured", cvar_type=client.CvarType.STRING))
+        for supplied, expected in ((None, "configured"), ("override", "override"), ("", "")):
+            with self.subTest(supplied=supplied):
+                connection = FakeConnection()
+                with mock.patch.object(client.aiodgram.DatagramConnection, "connect",
+                                       new=mock.AsyncMock(return_value=connection)) as connect:
+                    active = await client.AsyncClient.connect("localhost", 26000, password=supplied)
+                try:
+                    connect.assert_awaited_once_with("localhost", 26000, None, password=expected)
+                finally:
+                    await active.disconnect()
+
+
 class HelpersTests(unittest.TestCase):
+    def test_masked_player_names_have_plain_canonical_keys(self):
+        masked = "".join(chr(ord(char) | 0x80) for char in "player")
+        self.assertEqual(client._sanitize_player_name(masked), "player")
+        self.assertEqual(client._name_key(masked), client._name_key("player"))
+        colored = client.ANSI_RED + "player" + client.ANSI_RESET
+        self.assertEqual(client._sanitize_player_name(colored), "player")
+
     def test_commands_preserve_quotes_and_escaped_quotes(self):
         self.assertEqual(client._split_queued_commands('echo "a;b"; wait\necho done'),
                          ['echo "a;b"', 'wait', 'echo done'])

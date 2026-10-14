@@ -1067,6 +1067,9 @@ def _strip_quake_colors(
     """
     if not s:
         return s
+    if strip_ansi_codes:
+        # Strip existing terminal escapes before dequaking maps ESC to a digit.
+        s = strip_ansi(s)
     # Choose rendering path: color masked-red glyphs or plain dequake.
     s = _dequake_with_red(s) if colorize_masked_red else dequake_text(s)
     # Strip Quake-style caret color codes (digits or letters like ^m)
@@ -1588,11 +1591,7 @@ def _sanitize_player_name(s: str) -> str:
       - trim and clamp to 15 visible chars (classic limit)
       - provide a fallback if empty
     """
-    s = _strip_quake_colors(s or "")
-    s = re.sub(r"[\x00-\x1F]", "", s).strip()
-    if len(s) > 15:
-        s = s[:15]
-    return s or "pyquake-m"
+    return _sanitize_player_name_full(s)[:15] or "pyquake-m"
 
 def _name_key(s: str) -> str:
     """Canonical key for merging/lookup: sanitized 15-char name, case-insensitive."""
@@ -1686,18 +1685,6 @@ def _debug_print_color_event(src: str,
         CON.write(f"[c] {src_abbrev} p{idx or '?'}:{name_initials} c{resolved or '?'} {emoji or ''}")
     except Exception:
         pass
-
-def _decode_bottom_from_colormap(val: int | None) -> int | None:
-    """
-    Classic player colormap packs colors as (top<<4 | bottom).
-    Return bottomcolor (0..15) from colormap's low nibble.
-    """
-    if val is None:
-        return None
-    try:
-        return int(val) & 15
-    except Exception:
-        return None
 
 def _parse_info_string(info: str) -> dict[str, str]:
     """Parse Quake \\key\\value userinfo into a dict (tolerant)."""
@@ -2922,7 +2909,7 @@ class Demo:
             while remaining_msg:
                 parsed, remaining_msg = proto.ServerMessage.parse_message(
                         remaining_msg, protocol)
-                if parsed.msg_type == proto.ServerMessageType.SERVERINFO:
+                if parsed.msg_type in (proto.ServerMessageType.SERVERINFO, proto.ServerMessageType.VERSION):
                     protocol = parsed.protocol
                 parsed_msgs.append(parsed)
             yield parsed_msgs
@@ -3154,6 +3141,8 @@ class AsyncClient:
         self._pq_seconds: int | None = None
         self._pq_last_time_seen: float | None = None
         self._pq_paused: bool = False
+        self._pq_pause_time: float | None = None
+        self._pq_uses_server_time: bool = False
         self._pq_team_frags: dict[int, int] = {}      # team(bottomcolor) -> frags
         self._pq_team_colors: dict[int, int] = {}     # team -> packed colors (16*shirt + team)
         self._pq_teamgame_hint: bool = False          # set true when we see any PQ team msg
@@ -3161,6 +3150,7 @@ class AsyncClient:
         self._serverinfo_is: 'InfoString' = InfoString()
         self._myinfo_is: 'InfoString' = InfoString()
         self._userinfo_is: dict[int, 'InfoString'] = {}
+        self._synthetic_userinfo: dict[int, 'InfoString'] = {}
 
         # --- Client-side network counters (best-effort) ---
         # Names chosen to mirror Quake's NET_Stats_f output where possible.
@@ -3204,11 +3194,13 @@ class AsyncClient:
             pass
 
     def _on_userinfo_changed(self, slot: int) -> None:
-        """
-        Hook point for reacting to per-player userinfo changes (e.g., color/name cache).
-        Currently quiet to avoid spam.
-        """
-        pass
+        """Reflect server-supplied player colors in the live scoreboard."""
+        info = self._userinfo_is.get(slot, {})
+        row = self._score_state.setdefault(slot, {})
+        for key in ("topcolor", "bottomcolor"):
+            value = _safe_int(info.get(key))
+            if value is not None:
+                row[key] = value & 15
 
     # -------------------- Stufftext info-extension handlers --------------------
     def _handle_info_stufftext(self, line: str) -> bool:
@@ -3253,7 +3245,7 @@ class AsyncClient:
                         payload = parts[1].strip()
                         if (payload[:1], payload[-1:]) in {('"','"'), ("'","'")}:
                             payload = payload[1:-1]
-                if payload:
+                if len(toks) >= 2:
                     self._serverinfo_is = InfoString.parse(payload)
                     self._on_serverinfo_updated()
                 return True
@@ -3282,7 +3274,7 @@ class AsyncClient:
                         slot = int(toks[1])
                     except Exception:
                         return True
-                    islots = self._userinfo_is.get(slot) or InfoString()
+                    islots = InfoString(self._userinfo_is.get(slot) or {})
                     info_set_key(islots, _qs(2), _qs(3))
                     self._userinfo_is[slot] = islots
                     self._on_userinfo_changed(slot)
@@ -3299,31 +3291,19 @@ class AsyncClient:
         supports it; otherwise fall back to RELIABLE so the server still sees seq/ack.
         This guarantees the server will bump last_message/lastmovemessage.
         """
-        try:
-            sent_unreliable = False
-            if hasattr(self._conn, "send_unreliable"):
-                maybe = self._conn.send_unreliable(payload)
-                if inspect.isawaitable(maybe):
-                    await maybe
-                sent_unreliable = True
-            elif hasattr(self._conn, "send"):
-                # Some transports name it `send` but still frame it correctly.
-                maybe = self._conn.send(payload)
-                if inspect.isawaitable(maybe):
-                    await maybe
-            else:
-                await self.send_reliable_raw(payload)  # last-resort, but framed
-        finally:
-            self.last_tx_at = time.monotonic()
-            # Count packet + bytes
-            try:
-                self._net_stats["packets_sent"] += 1
-                self._net_stats["bytes_sent"] += int(len(payload) or 0)
-                if sent_unreliable:
-                    self._net_stats["unreliable_messages_sent"] += 1
-                # If we fell back to reliable, send_reliable_raw will increment reliable counters.
-            except Exception:
-                pass
+        if hasattr(self._conn, "send_unreliable"):
+            maybe = self._conn.send_unreliable(payload)
+        elif hasattr(self._conn, "send"):
+            # Some transports name it `send` but still frame it correctly.
+            maybe = self._conn.send(payload)
+        else:
+            await self.send_reliable_raw(payload)  # Counts the reliable fallback.
+            return
+        await self._maybe_await(maybe)
+        self.last_tx_at = time.monotonic()
+        self._net_stats["packets_sent"] += 1
+        self._net_stats["bytes_sent"] += len(payload)
+        self._net_stats["unreliable_messages_sent"] += 1
 
     @property
     def player_entity(self):
@@ -3341,9 +3321,10 @@ class AsyncClient:
     def _pq_read_byte_pq(self, b: bytes, i: int) -> tuple[int, int]:
         """ProQuake MSG_ReadBytePQ: next two bytes are high/low nibbles; returns value and new index."""
         if i + 1 >= len(b):
-            return (0, i + 2)
-        v = b[i] * 16 + b[i + 1] - 272
-        return (int(v) & 0xFF, i + 2)
+            raise ValueError("truncated PQ byte")
+        if not (16 <= b[i] <= 31 and 16 <= b[i + 1] <= 31):
+            raise ValueError("invalid PQ nibbles")
+        return (b[i] * 16 + b[i + 1] - 272, i + 2)
 
     def _pq_read_short_pq(self, b: bytes, i: int) -> tuple[int, int]:
         """ProQuake MSG_ReadShortPQ (big-endian of two PQ-bytes); signed 16-bit."""
@@ -3358,102 +3339,108 @@ class AsyncClient:
         self._pq_team_frags.clear()
         self._pq_team_colors.clear()
 
-    def _handle_proquake_stufftext(self, s: str) -> bool:
-        """
-        Try to parse a ProQuake payload that rides inside svc_stufftext.
-        Heuristic by total length (avoids needing cmd IDs):
-          0: b[0] must be 0x01 (MOD_PROQUAKE marker)
-          1: cmd (ignored here)
-        Lengths:
-          2  -> match_reset
-          3  -> erase_team: [team]
-          4  -> new_team:   [team][shirt]
-          5  -> team_frags: [team][frags(PQ-short)]
-          6  -> match_time: [minutes(PQ-byte)][seconds(PQ-byte)]
-        Returns True if it *was* a PQ message (consumed).
-        """
-        if not isinstance(s, str) or not s:
-            return False
-        b = s.encode("latin-1", "ignore")
-        if not b or b[0] != 0x01:
-            return False
+    def _handle_proquake_stufftext(self, s: str) -> str:
+        """Apply a PQ command prefix and return any following ordinary stufftext.
 
-        # Skip 0x01 and cmd byte
+        PQ shorts occupy four encoded bytes. Unknown or malformed payloads are
+        discarded without changing state or interpreting binary data as commands.
+        """
+        if not s.startswith("\x01"):
+            return s
+        b = s.encode("latin-1")
         if len(b) < 2:
-            return True
-        cmd_byte = b[1]
-        n = len(b)
-
-        # match_reset (no args)
-        if n == 2:
-            self._pq_teamgame_hint = True
-            self._pq_reset_teams()
-            # timer isn't explicitly reset here in PQ; leave as-is
-            return True
-
-        # erase_team: [team]
-        if n == 3:
-            self._pq_teamgame_hint = True
-            team = int(b[2]) - 16
-            if 0 <= team <= 15:
+            return ""
+        cmd = b[1]
+        # pqc_nop, new_team, erase_team, team_frags, match_time, match_reset
+        size = {1: 2, 2: 4, 3: 3, 4: 7, 5: 6, 6: 2}.get(cmd)
+        if size is None:
+            logger.debug("Ignoring unknown ProQuake command %d", cmd)
+            return ""
+        try:
+            if len(b) < size:
+                raise ValueError("truncated payload")
+            if cmd in (2, 3, 4):
+                team = b[2] - 16
+                if not 0 <= team <= 13:
+                    raise ValueError("invalid team color")
+            if cmd == 2:
+                shirt = b[3] - 16
+                if not 0 <= shirt <= 15:
+                    raise ValueError("invalid shirt color")
+                self._pq_team_colors[team] = 16 * shirt + team
+                self._pq_team_frags[team] = 0
+            elif cmd == 3:
                 self._pq_team_colors.pop(team, None)
                 self._pq_team_frags.pop(team, None)
-            return True
-
-        # new_team: [team][shirt]
-        if n == 4:
-            self._pq_teamgame_hint = True
-            team = int(b[2]) - 16
-            shirt = int(b[3]) - 16
-            if 0 <= team <= 15 and 0 <= shirt <= 15:
-                self._pq_team_colors[team] = 16 * shirt + team
-                self._pq_team_frags.setdefault(team, 0)
-            return True
-
-        # team_frags: [team][frags(PQ-short)]
-        if n == 5:
-            self._pq_teamgame_hint = True
-            team = int(b[2]) - 16
-            if 0 <= team <= 15:
+            elif cmd == 4:
                 frags, _ = self._pq_read_short_pq(b, 3)
-                self._pq_team_frags[team] = int(frags)
-            return True
+                self._pq_team_frags[team] = frags
+            elif cmd == 5:
+                minutes, i = self._pq_read_byte_pq(b, 2)
+                seconds, _ = self._pq_read_byte_pq(b, i)
+                self._set_match_time(minutes, seconds)
+            elif cmd == 6:
+                self._pq_reset_teams()
+            if cmd in (2, 4, 5, 6):
+                self._pq_teamgame_hint = True
+        except ValueError as exc:
+            logger.warning("Ignoring malformed ProQuake command %d: %s", cmd, exc)
+            return ""
+        return s[size:]
 
-        # match_time: [minutes(PQ-byte)][seconds(PQ-byte)]
-        if n == 6:
+    def _pq_clock_now(self) -> float:
+        # Keep the clock source of the last sample until another sample arrives,
+        # so a timer received before the first svc_time cannot jump on signon.
+        if self._pq_uses_server_time and self.time is not None:
+            return self.time
+        return self._mono_now()
+
+    def _set_match_time(self, minutes: int, seconds: int) -> None:
+        self._pq_minutes, self._pq_seconds = minutes, seconds
+        self._pq_uses_server_time = self.time is not None
+        self._pq_last_time_seen = self._pq_clock_now()
+        if self._pq_paused:
+            self._pq_pause_time = self._pq_last_time_seen
+
+    def _handle_proquake_print(self, text: str) -> None:
+        """Handle legacy printed timer samples and match pause notifications."""
+        text = text.strip()
+        match = re.fullmatch(r"Match ends in (\d+) minutes?(?: remaining)?|(\d+) minutes? remaining",
+                             text)
+        if match:
+            self._set_match_time(int(match.group(1) or match.group(2)), 0)
             self._pq_teamgame_hint = True
-            i = 2
-            minutes, i = self._pq_read_byte_pq(b, i)
-            seconds, i = self._pq_read_byte_pq(b, i)
-            # '255' means 'not set' in many PQ engines; treat as unset
-            if minutes == 255 and seconds == 255:
-                self._pq_minutes = None
-                self._pq_seconds = None
-                self._pq_last_time_seen = None
-            else:
-                self._pq_minutes = int(minutes)
-                self._pq_seconds = int(seconds)
-                self._pq_last_time_seen = self.time if self.time is not None else time.monotonic() - self._mono0
-                self._pq_paused = False
-            return True
-
-        # Unknown PQ payload (still consume so normal stufftext handlers don't choke)
-        return True
+        elif text == "Match paused":
+            if not self._pq_paused:
+                self._pq_pause_time = self._pq_clock_now()
+                self._pq_paused = True
+        elif text == "Match unpaused":
+            if self._pq_paused and self._pq_pause_time is not None:
+                if self._pq_last_time_seen is not None:
+                    self._pq_last_time_seen += max(0.0, self._pq_clock_now() - self._pq_pause_time)
+            self._pq_paused = False
+            self._pq_pause_time = None
+        elif text == "The match is over":
+            self._pq_paused = False
+            self._pq_pause_time = None
+            self._set_match_time(255, 0)
 
     def _current_match_time(self) -> tuple[int, int] | None:
-        """Return (mm, ss) counting down if we have PQ time, else None."""
-        if self._pq_minutes is None or self._pq_seconds is None:
+        """Return remaining (mm, ss), SD (254, 0), or a negative countdown."""
+        if self._pq_minutes in (None, 255) or self._pq_seconds is None:
             return None
         mm = int(self._pq_minutes)
         ss = int(self._pq_seconds)
-        if self._pq_paused:
-            return (max(0, mm), max(0, min(59, ss)))
-        # advance based on server TIME (preferred) or monotonic fallback
+        if mm == 254:
+            return (254, 0)
+        if ss >= 128:
+            return (0, -(ss - 128))
         if self._pq_last_time_seen is not None:
-            now = self.time if self.time is not None else self._mono_now()
+            now = self._pq_pause_time if self._pq_paused else self._pq_clock_now()
+            if now is None:
+                now = self._pq_last_time_seen
             dt = max(0.0, float(now) - float(self._pq_last_time_seen))
-            # Tick down
-            total = max(0, mm * 60 + ss - int(dt + 0.5))
+            total = max(0, math.ceil(mm * 60 + ss - dt))
             return (total // 60, total % 60)
         return (mm, ss)
 
@@ -3521,13 +3508,18 @@ class AsyncClient:
         or
             "          0:00     No Teams"
         """
-        # Timer (or 0:00)
         t = self._current_match_time()
-        if t is None:
-            # NEW: when the PQ timer isn't running, use serverinfo matchtime
-            t = self._fallback_matchtime_from_serverinfo()
-        mm, ss = (t if t is not None else (0, 0))
-        timer = f"{mm}:{ss:02d}"
+        if self._pq_minutes == 255:
+            timer = ""  # An explicit hidden clock must not use serverinfo fallback.
+        elif self._pq_minutes == 254:
+            timer = "SD"
+        elif self._pq_seconds is not None and self._pq_seconds >= 128:
+            timer = f"-0:{self._pq_seconds - 128:02d}"
+        else:
+            if t is None:
+                t = self._fallback_matchtime_from_serverinfo()
+            mm, ss = (t if t is not None else (0, 0))
+            timer = f"{mm}:{ss:02d}"
 
         # Teams
         totals, have_teams = self._teams_for_footer()
@@ -3670,14 +3662,10 @@ class AsyncClient:
                     DBG_ONCE("stufftext", f"STUFFTEXT: {parsed.string.strip()[:90]!r}")
                     if parsed.string.strip() == "cmd pext":
                         DBG("pext negotiation requested by server; replying with zeros")
-                    # ProQuake piggy-back: short binary blobs inside STUFFTEXT
-                    try:
-                        if self._handle_proquake_stufftext(parsed.string):
-                            # It was a PQ message — don't treat it like normal text commands
-                            continue
-                    except Exception:
-                        # Never break the rx loop on malformed PQ blobs
-                        pass
+                    # PQ binary prefixes can be followed by ordinary stufftext.
+                    parsed.string = self._handle_proquake_stufftext(parsed.string)
+                    if not parsed.string:
+                        continue
 
                     # Handle protocol extension negotiation
                     if parsed.string.strip() == "cmd pext":
@@ -3760,6 +3748,9 @@ class AsyncClient:
 
                             low = sline.lower()
 
+                            if self._handle_info_stufftext(sline):
+                                continue
+
                             # fullserverinfo / serverinfo "<info>"  (quotes optional)
                             if low.startswith("fullserverinfo ") or low.startswith("serverinfo "):
                                 payload = sline.split(None, 1)[1]
@@ -3771,6 +3762,7 @@ class AsyncClient:
                             if m:
                                 slot = int(m.group(1))
                                 self._userinfo_is[slot] = InfoString.parse(m.group(2))
+                                self._on_userinfo_changed(slot)
                                 DBG_ONCE("userinfo-slot", f"userinfo for slot {slot} (keys={len(self._userinfo_is[slot])})")
                                 continue
                             # userinfo <info>           (ours)
@@ -3875,33 +3867,7 @@ class AsyncClient:
                     except Exception:
                         pass
 
-                    # --- ProQuake textual timer + pause/unpause/over ---
-                    if msg.startswith("Match ends in "):
-                        # "Match ends in <N> minutes remaining"
-                        try:
-                            rem = msg[len("Match ends in "):]
-                            mins = int(rem.split()[0])
-                            self._pq_minutes = mins
-                            self._pq_seconds = 0
-                            self._pq_last_time_seen = self.time if self.time is not None else self._mono_now()
-                            self._pq_paused = False
-                            self._pq_teamgame_hint = True
-                        except Exception:
-                            pass
-                    elif msg == "Match paused\n" or msg == "Match paused":
-                        self._pq_paused = True
-                    elif msg == "Match unpaused\n" or msg == "Match unpaused":
-                        # shift timer forward by the paused duration; we don't know it exactly here,
-                        # but resuming PQ binary time updates will re-sync quickly
-                        self._pq_paused = False
-                        if self._pq_last_time_seen is None:
-                            self._pq_last_time_seen = self.time if self.time is not None else self._mono_now()
-                    elif msg == "The match is over\n" or msg == "The match is over":
-                        self._pq_paused = False
-                        self._pq_last_time_seen = None
-                        # freeze timer at zero
-                        self._pq_minutes = 0
-                        self._pq_seconds = 0
+                    self._handle_proquake_print(msg)
 
                     _display_server_print(parsed.string)
 
@@ -3925,11 +3891,14 @@ class AsyncClient:
                     self.entities.clear()
                     self.baselines.clear()
                     self._userinfo_is.clear()
+                    self._synthetic_userinfo.clear()
                     self._latest_ping_by_name.clear()
                     self._pq_reset_teams()
                     self._pq_teamgame_hint = False
                     self._pq_minutes = self._pq_seconds = self._pq_last_time_seen = None
                     self._pq_paused = False
+                    self._pq_pause_time = None
+                    self._pq_uses_server_time = False
                     if self._spawned_fut.done():
                         self._spawned_fut = asyncio.Future()
                     self.models = parsed.models
@@ -3967,6 +3936,9 @@ class AsyncClient:
                     except Exception:
                         pass
 
+                if parsed.msg_type == proto.ServerMessageType.VERSION:
+                    self.protocol = parsed.protocol
+
                 # --- Live scoreboard updates (names, frags, colors) -------------
                 # These are classic NetQuake svc_* messages; proto enums vary a bit across forks,
                 # so we guard with hasattr/getattr to avoid hard-failing if absent.
@@ -3977,29 +3949,22 @@ class AsyncClient:
                         if i is not None and nm_raw is not None:
                             row = self._score_state.setdefault(int(i), {})
                             nm_full = _sanitize_player_name_full(nm_raw)
-                            nm_short = _sanitize_player_name(nm_raw)  # classic 15-char display
+                            nm_short = nm_full[:15]  # Empty names mark unused slots.
                             if nm_short:
+                                if row.get("name") != nm_short:
+                                    self._latest_ping_by_name.pop(row.get("name", ""), None)
+                                    row.pop("name_full", None)
                                 row["active"] = True
                                 row["name"] = nm_short
                                 # Only upgrade; never downgrade name_full
                                 _maybe_upgrade_name_full(row, nm_short, nm_full)
-                                # Seed bottomcolor from baseline colormap ONLY if it looks packed (>=16).
-                                try:
-                                    base = self.baselines.get(int(i) + 1)  # player entities are 1..maxclients
-                                    baseline_cm = getattr(base, "colormap", None)
-                                    if isinstance(baseline_cm, int) and baseline_cm >= 16 and "bottomcolor" not in row:
-                                        bc = baseline_cm & 15
-                                        row["bottomcolor"] = bc
-                                        _debug_print_color_event("baseline/nameseen",
-                                                                 int(i), nm_short,
-                                                                 None, None, baseline_cm, bc, _pants_color_emoji(bc))
-                                except Exception:
-                                    pass
                             else:
-                                # Blank/unused slot → mark inactive and drop the name
+                                # Release cached state before this slot is reused.
+                                self._latest_ping_by_name.pop(row.get("name", ""), None)
+                                self._userinfo_is.pop(int(i), None)
+                                self._synthetic_userinfo.pop(int(i), None)
+                                row.clear()
                                 row["active"] = False
-                                row.pop("name", None)
-                                row.pop("name_full", None)
                             row["t_last"] = time.monotonic()
                 except Exception:
                     pass
@@ -4007,7 +3972,7 @@ class AsyncClient:
                 try:
                     if hasattr(proto.ServerMessageType, "UPDATEFRAGS") and parsed.msg_type == proto.ServerMessageType.UPDATEFRAGS:
                         i = getattr(parsed, "client", getattr(parsed, "client_num", None))
-                        fr = getattr(parsed, "frags", None)
+                        fr = parsed.count
                         if i is not None and fr is not None:
                             row = self._score_state.setdefault(int(i), {})
                             row["frags"] = int(fr)
@@ -4074,6 +4039,7 @@ class AsyncClient:
                             row = self._score_state.setdefault(int(i), {})
                             if bottom is not None:
                                 row["bottomcolor"] = int(bottom) & 15
+                            row["topcolor"] = (parsed.color >> 4) & 15
                             # debug line
                             try:
                                 base = self.baselines.get(int(i) + 1)
@@ -4164,50 +4130,10 @@ class AsyncClient:
                                        proto.ServerMessageType.SPAWNBASELINE2):
                     ent = Entity.from_baseline(parsed)
                     self.baselines[parsed.entity_num] = ent
-                    # If this looks like a player entity, populate bottomcolor from colormap immediately.
-                    try:
-                        idx = int(parsed.entity_num) - 1
-                        row = self._score_state.get(idx)
-                        if row is not None:
-                            baseline_cm = getattr(ent, "colormap", None)
-                            # Only trust baseline colormap if it looks like packed colors (>=16).
-                            if isinstance(baseline_cm, int):
-                                row["colormap"] = baseline_cm
-                                if baseline_cm >= 16:
-                                    bc = baseline_cm & 15
-                                    row["bottomcolor"] = bc
-                                    _debug_print_color_event("baseline", idx, row.get("name"),
-                                                             None, None, baseline_cm, bc, _pants_color_emoji(bc))
-                                    row["t_last"] = time.monotonic()
-                    except Exception:
-                        pass
                 if parsed.msg_type == proto.ServerMessageType.UPDATE:
                     ent_num = parsed.entity_num
                     baseline = self.baselines.get(ent_num, zero_baseline)
                     next_entities[ent_num] = baseline.update(parsed)
-                    # If this UPDATE carries/changes colormap for a player, store it;
-                    # only derive bottomcolor if cm looks packed (>=16).
-                    try:
-                        if 1 <= int(ent_num) <= 64:
-                            ent_now = next_entities.get(ent_num)
-                            if ent_now is not None:
-                                cm = getattr(ent_now, "colormap", None)
-                                if cm is not None:
-                                    row = self._score_state.get(int(ent_num) - 1)
-                                    if row is not None:
-                                        row["colormap"] = _safe_int(cm)
-                                        if isinstance(cm, int) and cm >= 16:
-                                            bc = cm & 15
-                                            row["bottomcolor"] = bc
-                                            if _COLOR_DEBUG:
-                                                _debug_print_color_event(
-                                                    "update-colormap",
-                                                    int(ent_num) - 1, row.get("name"),
-                                                    bc, None, int(cm), row.get("bottomcolor"),
-                                                    _pants_color_emoji(row.get("bottomcolor"))
-                                                )
-                    except Exception:
-                        pass
 
 
                 if parsed.msg_type == proto.ServerMessageType.CENTERPRINT:
@@ -4291,13 +4217,16 @@ class AsyncClient:
         self._conn.disconnect()
 
     @classmethod
-    async def connect(cls, host, port, joequake_version=None):
+    async def connect(cls, host, port, joequake_version=None, *, password=None):
         """Connect to the given host and port, and start listening for messages.
 
         At the point this coroutine returns, no messages have yet been read.
 
         """
-        conn = await aiodgram.DatagramConnection.connect(host, port, joequake_version)
+        if password is None:
+            password = cvar_system.get_string("password", "") if "cvar_system" in globals() else ""
+        conn = await aiodgram.DatagramConnection.connect(host, port, joequake_version,
+                                                        password=password)
 
         client = cls(conn)
         client._read_task = asyncio.create_task(client._read_messages())
@@ -4397,7 +4326,7 @@ class AsyncClient:
     @property
     def high_res_inputs(self):
         return (
-            self.joequake_version is not None
+            getattr(self._conn, "proquake_angle_hack", False)
             or self.protocol.version != proto.ProtocolVersion.NETQUAKE
         )
 
@@ -4438,20 +4367,18 @@ class AsyncClient:
     def _synthesize_userinfo_from_scoreboard(self) -> None:
         """
         If no real userinfo arrived for a slot, create a tiny InfoString with
-        name/topcolor/bottomcolor inferred from scoreboard/colormap.
+        name/topcolor/bottomcolor inferred from scoreboard updates.
         """
         for idx, row in self._score_state.items():
             if not row.get("active"):
                 continue
-            if idx in self._userinfo_is:
+            if (idx in self._userinfo_is
+                    and self._userinfo_is[idx] is not self._synthetic_userinfo.get(idx)):
                 continue  # real userinfo already present
 
             nm = row.get("name") or row.get("name_full")
             bc = row.get("bottomcolor")
-            tc = None
-            cm = row.get("colormap")
-            if isinstance(cm, int) and cm >= 16:
-                tc = (cm >> 4) & 15
+            tc = row.get("topcolor")
 
             isynth = InfoString()
             if nm: isynth["name"] = nm
@@ -4460,6 +4387,7 @@ class AsyncClient:
 
             if isynth:
                 self._userinfo_is[idx] = isynth
+                self._synthetic_userinfo[idx] = isynth
 
     # -------- showscores helpers: ping sweep & parsing ----------
     def _update_pings_from_lines(self, lines: list[str]) -> None:
@@ -4470,8 +4398,10 @@ class AsyncClient:
         try:
             in_block = False
             found_any = False
-            for raw in lines:
-                s = _strip_quake_colors(raw).strip()
+            # svc_print chunks can split a row or contain the entire ping table.
+            for raw in "".join(lines).splitlines():
+                s = _strip_quake_colors(raw, colorize_masked_red=False,
+                                       strip_ansi_codes=True).strip()
                 if not s:
                     continue
                 if s.lower().startswith("client ping times"):
@@ -4543,13 +4473,6 @@ def _bottom_for_name_key(score_state: dict[int, dict], name_k: str) -> int | Non
             bc = _info_get_int(r.get("userinfo"), "bottomcolor")
             if bc is not None:
                 return bc & 15
-            # 3) last resort: only derive from colormap if it looks packed (>=16)
-            cm = r.get("colormap")
-            try:
-                if isinstance(cm, int) and cm >= 16:
-                    return cm & 15
-            except Exception:
-                pass
     return None
 
 def _maybe_self_bottom(client: "AsyncClient", name_k: str) -> int | None:
@@ -4564,13 +4487,8 @@ def _maybe_self_bottom(client: "AsyncClient", name_k: str) -> int | None:
                     return bc & 15
             except Exception:
                 pass
-            # Fallback: packed fields if present
-            try:
-                cm = _safe_int(client.myinfo_get("colormap", ""))
-                if cm is not None and cm >= 16:
-                    return cm & 15
-            except Exception:
-                pass
+            # Fallback: packed colors if present. Entity colormaps are player
+            # slot references, so they must never be decoded as shirt/pants.
             try:
                 colors = _safe_int(client.myinfo_get("colors", ""))
                 if colors is not None:
@@ -4798,7 +4716,7 @@ async def _aioclient(args=None):
                               minimum=1000, maximum=25000, description="client rate hint"))
 
     # Password CVAR for server authentication
-    cvar_system.register(Cvar("password", "", CvarFlags.USERINFO,
+    cvar_system.register(Cvar("password", "", CvarFlags.NONE,
                               cvar_type=CvarType.STRING, description="server password"))
 
     # RCON password CVAR

@@ -19,6 +19,15 @@ python3 -m pyquake.client test localhost 26000
 
 Use `help` in the console to list commands and `quit` to exit. Settings and aliases are saved to `config.cfg` in the current working directory.
 
+ProQuake connections automatically negotiate 16-bit input angles when supported. For a password-protected server, set the password before connecting; numeric and text passwords are supported:
+
+```text
+password "your password"
+connect localhost:26000
+```
+
+The scoreboard reads ProQuake team scores and match clocks, including pauses, sudden death (`SD`), and negative countdowns.
+
 Input defaults to commands (`cl_chatmode 0`), so `ready` reaches the server as a command. Use `say hello` or `s hello` to chat. The archived `cl_chatmode` setting controls typed input:
 
 | Value | Behavior |
