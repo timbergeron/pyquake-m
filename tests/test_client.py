@@ -173,6 +173,19 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
             client.cvar_system = self.cvars
             await standalone.disconnect()
 
+    async def test_received_server_prints_preserve_blank_lines_and_colon_labels(self):
+        output = io.StringIO()
+        console = client._ConsoleBuffer()
+        waiting = asyncio.create_task(self.client.wait_for_center_print())
+        await asyncio.sleep(0)
+        chunks = ("\n", "match statistics\n", "\n", "map      \b:\b ", "q1q3hektik\n",
+                  "\n", "\befficiency\b\n", "\n")
+        packet = b"".join(b"\x08" + chunk.encode("latin-1") + b"\0" for chunk in chunks)
+        with mock.patch.object(client, "CON", console), mock.patch("sys.stdout", output):
+            self.conn.incoming.put_nowait(packet + b"\x1afinished\0")
+            await asyncio.wait_for(waiting, 1)
+        self.assertEqual(output.getvalue(), "\n  match statistics\n\n  map      : q1q3hektik\n\n  efficiency\n\n")
+
     async def test_console_reconnect_uses_new_client_and_cleans_up_tasks(self):
         connections = []
         background_tasks = []

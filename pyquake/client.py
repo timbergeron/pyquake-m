@@ -604,12 +604,10 @@ class _ConsoleBuffer:
         # --- line-stitching state ---
         self._line_open: bool = False         # currently appending a line to the terminal
         self._pending_line: str = ""          # accumulated text for current line
-        self._stitch_last_at: float = 0.0     # last append time (monotonic)
-        self._stitch_timeout: float = 0.35    # seconds; finalize if idle gap exceeds this
 
-    def _finalize_line(self):
+    def _finalize_line(self, *, force: bool = False):
         """Emit a newline if a stitched line is open, store it in history, and reset."""
-        if not self._line_open:
+        if not self._line_open and not force:
             return
         # Finish the terminal line
         sys.stdout.write("\n")
@@ -619,25 +617,19 @@ class _ConsoleBuffer:
         # Reset state
         self._pending_line = ""
         self._line_open = False
-        self._stitch_last_at = 0.0
 
     def newline(self):
-        """Public alias: finalize any stitched line."""
-        self._finalize_line()
+        """Emit one explicit newline, including an empty line when none is open."""
+        self._finalize_line(force=True)
 
     def append(self, s: str, prefix: str = ""):
         """
         Append a chunk to the current console line without forcing a newline.
         If no line is open, start one (optionally with a prefix, printed once).
-        Idle gaps > _stitch_timeout auto-finalize the previous line first.
         """
         if s is None:
             return
         s = str(s)
-        now = time.monotonic()
-        if self._line_open and now - self._stitch_last_at > self._stitch_timeout:
-            # Long gap → assume previous message completed
-            self._finalize_line()
         if not self._line_open:
             # Start a new visible line (emit prefix once)
             if prefix:
@@ -648,7 +640,6 @@ class _ConsoleBuffer:
         sys.stdout.write(s)
         sys.stdout.flush()
         self._pending_line += s
-        self._stitch_last_at = now
 
     def write(self, s: str):
         # Suppress certain noisy diagnostics unless developer is enabled.
@@ -670,7 +661,6 @@ class _ConsoleBuffer:
         # Reset any open stitched line
         self._pending_line = ""
         self._line_open = False
-        self._stitch_last_at = 0.0
         try:
             if os.name == "nt":
                 os.system("cls")
@@ -1127,55 +1117,33 @@ def _display_server_print(raw: str) -> None:
         except Exception:
             pass
         return
-    # Try both chat forms:
-    m  = _CHAT_RE.match(txt)              # "(TEAM) nick: msg" or "nick: msg"
-    m2 = _CHAT_TEAM_ALT_RE.match(txt)     # ".(nick): msg" or "(nick): msg"
-
-    # Alt team format: strip any leading '.' and render as "(nick): msg"
-    if m2:
-        nick = re.sub(r'^[.#]+', '', m2.group("nick"))
-        if _is_known_player_name(nick):
-            msg  = m2.group("msg")
-            CON.newline()
-            CON.write(f"({nick}): {msg}")
-            return
-        # else: fall through and treat as a normal server print (indented)
-
-    # Primary format: render exactly like server does (no special 'You:' label)
-    if m:
-        team = m.group("t")
-        nick = re.sub(r'^[.#]+', '', m.group("nick"))
-        if _is_known_player_name(nick):
-            msg  = m.group("msg")
-            CON.newline()
-            if team:
-                CON.write(f"({team}) {nick}: {msg}")
-            else:
-                CON.write(f"{nick}: {msg}")
-            return
-        # else: not a known player → let it render as a normal server line
-    else:
-        # Non-chat server prints: stitch chunks into one visible line.
-        # Handle any embedded newlines explicitly.
-        parts = txt.split("\n")
-        for i, seg in enumerate(parts):
-            if seg:
-                # Hide dev-only chatter unless developer=1
-                try:
-                    if (not _dev_enabled()) and _is_dev_only_logline(seg):
-                        # Skip this segment entirely
-                        pass
+    # svc_print is a text stream: only server newlines terminate its lines.
+    # A print may contain several lines, one blank line, or part of a table row.
+    parts = txt.split("\n")
+    for i, seg in enumerate(parts):
+        if seg:
+            if not _dev_enabled() and _is_dev_only_logline(seg):
+                continue
+            prefix = "  "
+            if not CON._line_open:
+                for match, alternate in ((_CHAT_TEAM_ALT_RE.match(seg), True),
+                                         (_CHAT_RE.match(seg), False)):
+                    if match is None:
+                        continue
+                    nick = re.sub(r'^[.#]+', '', match.group("nick"))
+                    if not _is_known_player_name(nick):
+                        continue
+                    message = match.group("msg")
+                    if alternate:
+                        seg = f"({nick}): {message}"
+                    elif match.group("t"):
+                        seg = f"({match.group('t')}) {nick}: {message}"
                     else:
-                        # Indent once at the start of a new stitched line
-                        CON.append(seg, prefix="  ")
-                except Exception:
-                    CON.append(seg, prefix="  ")
-            if i < len(parts) - 1:
-                # Explicit newline inside the payload: finalize the current line
-                CON.newline()
-        # Heuristic: if this chunk ends a sentence, finalize now so it doesn't
-        # wait for the next incoming print to show up as a line.
-        if re.search(r"[.!?]\s*$", txt):
+                        seg = f"{nick}: {message}"
+                    prefix = ""
+                    break
+            CON.append(seg, prefix=prefix)
+        if i < len(parts) - 1:
             CON.newline()
 
 def _strip_slash_command_name(cmd: str) -> str:
@@ -1620,11 +1588,17 @@ def _is_known_player_name(nick: str) -> bool:
         return False
 
     # Check against local player name
-    me_name = _sanitize_player_name(cvar_system.get_string("name", ""))
-    if _name_key(nick) == _name_key(me_name):
+    cvars = globals().get("cvar_system")
+    me_name = cvars.get_string("name", "") if cvars is not None else ""
+    if me_name and _name_key(nick) == _name_key(me_name):
         return True
 
     # Check against server-known players (if we have a client)
+    if CURRENT_CLIENT:
+        nick_key = _name_key(nick)
+        for row in getattr(CURRENT_CLIENT, "_score_state", {}).values():
+            if row.get("active") and _name_key(row.get("name", "")) == nick_key:
+                return True
     if CURRENT_CLIENT and hasattr(CURRENT_CLIENT, '_players'):
         nick_key = _name_key(nick)
         for player in CURRENT_CLIENT._players.values():
