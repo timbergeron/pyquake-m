@@ -57,9 +57,13 @@ from threading import Event
 
 if __package__:
     from . import aiodgram, proto
+    from .commands import define_alias, split_commands, quote_arg
+    from .console import ConsoleSession, SERVER_COMMANDS
 else:
     import aiodgram
     import proto
+    from commands import define_alias, split_commands, quote_arg
+    from console import ConsoleSession, SERVER_COMMANDS
 from typing import Union
 
 # --- Windows UDP reliability: use SelectorEventLoop instead of Proactor ---
@@ -276,6 +280,7 @@ class CvarSystem:
         self._cvars: dict[str, Cvar] = {}
         self._aliases: dict[str, str] = {}  # alias -> canonical name
         self._commands: dict[str, Callable] = {}
+        self.command_aliases: dict[str, str] = {}
         self._config_file = "config.cfg"
         self._lock = threading.RLock()
         self._listeners: list[Callable[[Cvar, str, str], None]] = []
@@ -503,7 +508,7 @@ class CvarSystem:
             return result
 
     def write_variables(self, filename: Optional[str] = None) -> bool:
-        """Persist only archived CVARs, in bare form:  <name> "<value>"."""
+        """Save archived cvars and, when enabled, command aliases."""
         if filename is None:
             filename = self._config_file
         try:
@@ -511,72 +516,25 @@ class CvarSystem:
                 # Alphabetical output -> bottomcolor, name, topcolor, etc.
                 for cvar in sorted(self._cvars.values(), key=lambda c: c.name.lower()):
                     if cvar.flags & CvarFlags.ARCHIVE:
-                        # Escape backslashes and quotes
-                        val = cvar.string.replace("\\", "\\\\").replace('"', '\\"')
-                        f.write(f'{cvar.name} "{val}"\n')
+                        command = "seta " if cvar.flags & CvarFlags.USERDEFINED else ""
+                        f.write(f'{command}{cvar.name} {quote_arg(cvar.string)}\n')
+                if self.get_bool("cfg_save_aliases", True):
+                    for name, body in sorted(self.command_aliases.items(), key=lambda pair: pair[0].casefold()):
+                        body = "; ".join(split_commands(body))
+                        f.write(f"alias {quote_arg(name)} {quote_arg(body)}\n")
             self._last_write_snapshot = {c.name: c.string for c in self._cvars.values()}
             return True
         except Exception as e:
             print(f"Error writing config: {e}")
             return False
 
-    def load_config(self, filename: Optional[str] = None) -> bool:
-        """Load config: accepts either `name "v"` or legacy `set/seta name "v"`."""
-        if filename is None:
-            filename = self._config_file
-        if not os.path.exists(filename):
-            return False
-        try:
-            with open(filename, 'r', encoding='utf-8') as f:
-                for raw in f:
-                    line = raw.strip()
-                    if not line or line.startswith('//'):
-                        continue
-                    # Use shlex to respect quotes
-                    try:
-                        parts = shlex.split(line)
-                    except Exception:
-                        continue
-                    if not parts:
-                        continue
-                    # Forms:
-                    #   set name "v"
-                    #   seta name "v"
-                    #   name "v"
-                    if parts[0] in ('set', 'seta'):
-                        if len(parts) < 3:
-                            continue
-                        var_name = parts[1]
-                        # Skip (and actively remove) retired variables so they don't get reintroduced.
-                        if self._canon(var_name) in self._retired:
-                            # If it exists from a previous run, drop it.
-                            self.unregister_variable(var_name)
-                            continue
-                        var_value = ' '.join(parts[2:])
-                    else:
-                        if len(parts) < 2:
-                            continue
-                        var_name = parts[0]
-                        # Skip (and actively remove) retired variables.
-                        if self._canon(var_name) in self._retired:
-                            self.unregister_variable(var_name)
-                            continue
-                        var_value = ' '.join(parts[1:])
-                    # shlex already removed quotes, so var_value is raw
-                    # Be tolerant: if the CVAR isn't registered yet, quietly create it (archived).
-                    cv = self.find(var_name)
-                    if cv:
-                        self.set_quick(cv, var_value)
-                    else:
-                        # Prefer correct type for known booleans we expect in configs.
-                        ctype = CvarType.BOOL if var_name.lower() in ('con_logcenterprint', 'cmd_warncmd') else CvarType.STRING
-                        flags = CvarFlags.ARCHIVE | CvarFlags.USERDEFINED
-                        created = self.create(var_name, var_value, flags=flags, cvar_type=ctype)
-                        # If create failed (name collides with command), just ignore quietly.
-            return True
-        except Exception as e:
-            print(f"Error loading config: {e}")
-            return False
+    async def load_config(self, filename: Optional[str] = None) -> bool:
+        """Execute a config through the same dispatcher as console commands."""
+        filename = self._config_file if filename is None else filename
+        dispatcher = _get_console_session().dispatcher
+        ok = dispatcher.exec_file(filename)
+        await dispatcher.flush()
+        return ok
 
     def _format_float(self, value: float) -> str:
         if not math.isfinite(value):
@@ -894,110 +852,50 @@ _sayrand_msgs: list[list[str]] = [[] for _ in range(10)]
 _sayrand_order: list[list[int]] = [[] for _ in range(10)]
 _sayrand_next: list[int] = [0]*10
 
-# ==================== Command buffer (Cbuf_*) with 'wait' ====================
-_CBUF: list[str] = []
-_CBUF_BUSY = False
+# All console and script entry points share the active session's dispatcher.
+_CONSOLE_SESSION = None
+_EDIT_PREFILL = False
+
+
+def _get_console_session():
+    global _CONSOLE_SESSION
+    if _CONSOLE_SESSION is None or _CONSOLE_SESSION.cvars is not cvar_system:
+        _CONSOLE_SESSION = ConsoleSession(sys.modules[__name__])
+    return _CONSOLE_SESSION
+
+
+def _queue_commands(text, *, insert=False):
+    dispatcher = _get_console_session().dispatcher
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        asyncio.run(dispatcher.execute(text))
+    else:
+        context = dispatcher.current if insert else None
+        dispatcher.add_text(text, insert=insert, context=context,
+                            source=context.source if context else "command")
+
 
 def Cbuf_AddText(text: str) -> None:
-    """Append raw text (may include newlines/semicolons) to the command buffer."""
-    if not text:
-        return
-    cmds = _split_queued_commands(text)
-    _CBUF.extend(cmds)
-    _kick_cbuf()
+    _queue_commands(text)
+
 
 def Cbuf_InsertText(text: str) -> None:
-    """Prepend raw text to the command buffer."""
-    if not text:
-        return
-    cmds = _split_queued_commands(text)
-    global _CBUF
-    _CBUF = cmds + _CBUF
-    _kick_cbuf()
+    _queue_commands(text, insert=True)
 
-def _kick_cbuf() -> None:
-    """Start processing if not already running."""
-    global _CBUF_BUSY
-    if _CBUF_BUSY:
-        return
-    _CBUF_BUSY = True
-    try:
-        try:
-            # If there's a running loop, schedule the pump task on it.
-            loop = asyncio.get_running_loop()
-            loop.create_task(_cbuf_pump())
-            # ensure the idle reconnect loop is running on the same loop
-            try:
-                _ensure_idle_reconnect_task()
-            except Exception:
-                pass
-        except RuntimeError:
-            # No running loop → run synchronously so we don't get stuck busy.
-            asyncio.run(_cbuf_pump())
-    except Exception:
-        _CBUF_BUSY = False
-        raise
 
 async def _wait_next_frame(n: int = 1) -> None:
-    """Wait for the next client 'frame' (update). If offline, yield to loop."""
-    n = max(1, int(n))
-    for _ in range(n):
-        if CURRENT_CLIENT and CURRENT_CLIENT._alive and not CURRENT_CLIENT.disconnected:
+    for _ in range(max(1, int(n))):
+        active = CURRENT_CLIENT
+        if active and active._alive and not active.disconnected:
             try:
-                await CURRENT_CLIENT.wait_for_update()
-            except Exception:
-                await asyncio.sleep(0)
+                await active.wait_for_update()
+            except asyncio.CancelledError:
+                if active.disconnected:
+                    break
+                raise
         else:
             await asyncio.sleep(0)
-
-async def _cbuf_pump() -> None:
-    """Process commands in the buffer; 'wait' defers the remainder to next frame."""
-    global _CBUF_BUSY
-    try:
-        while _CBUF:
-            cmd = (_CBUF.pop(0) or "").strip()
-            if not cmd:
-                continue
-            # handle 'wait' (and 'wait N')
-            m = re.match(r'(?i)^wait(?:\s+(\d+))?$', cmd)
-            if m:
-                n = int(m.group(1) or "1")
-                await _wait_next_frame(n)
-                continue
-
-            # local commands first
-            if _handle_local_command(cmd):
-                continue
-
-            # expand aliases then send each; honor 'wait' inside alias bodies, too
-            cmds = []
-            if CURRENT_CLIENT:
-                cmds = CURRENT_CLIENT._expand_alias(cmd) or [cmd]
-            else:
-                cmds = [cmd]
-            for c in cmds:
-                m2 = re.match(r'(?i)^wait(?:\s+(\d+))?$', c.strip())
-                if m2:
-                    await _wait_next_frame(int(m2.group(1) or "1"))
-                    continue
-                # Try to forward if we have a client and it's not explicitly disconnected.
-                if CURRENT_CLIENT and not CURRENT_CLIENT.disconnected:
-                    try:
-                        await CURRENT_CLIENT.send_command(c)
-                        continue
-                    except Exception:
-                        # fall through to local echo
-                        pass
-                # Offline (or race during connect): if this looks like plain chat,
-                # render a friendly local echo with our name; otherwise keep the
-                # old "(offline)" marker so scripts aren't silently dropped.
-                if not _is_raw_server_command(c):
-                    me = _sanitize_player_name(cvar_system.get_string("name", "player"))
-                    CON.write(f"{me}: {c}")
-                else:
-                    CON.write(f"(offline) {c}")
-    finally:
-        _CBUF_BUSY = False
 
 # Show up on servers + *ver as PyQuake-M
 CLIENT_VER = f"pyquake-m/{platform.system().lower()}-{platform.machine().lower()} 0.1"
@@ -1383,31 +1281,11 @@ def _parse_hostport_spec(spec: str, default_port: int | None = None):
     return (host, port) if 1 <= port <= 65535 else None
 
 def _split_queued_commands(s: str) -> list[str]:
-    """Split Quake command lines while preserving quoted semicolons."""
-    parts: list[str] = []
-    start = 0
-    quoted = escaped = False
-    for i, char in enumerate(s):
-        if char in "\r\n" or (char == ";" and not quoted):
-            part = s[start:i].strip()
-            if part:
-                parts.append(part)
-            start = i + 1
-            quoted = escaped = False
-        elif escaped:
-            escaped = False
-        elif char == "\\" and quoted:
-            escaped = True
-        elif char == '"':
-            quoted = not quoted
-    part = s[start:].strip()
-    if part:
-        parts.append(part)
-    return parts
+    return split_commands(s)
 
 # Built-in client commands that shouldn't be shadowed; used for conflict rename.
 _RESERVED_CMDS = frozenset({
-    "help","cmdlist","aliaslist","clear","quit","disconnect","connect","reconnect","demo","kill","status",
+    "help","cmdlist","aliaslist","clear","quit","exit","q","scoreboard","extip","disconnect","connect","reconnect","demo","kill","status",
     "players","showscores","ping","impulse","name","color","say","say_team","tell","dm","pm","like",
     "condump","echo","exec","ip","extip","port","random",
     "reset","resetall","resetcfg","s","st","net_stats","unalias","unaliasall","wait",
@@ -1447,6 +1325,7 @@ def _tabcomp__all_command_names() -> list[str]:
     Union of built-in/reserved command names and anything registered via cvar_system.register_command().
     """
     names = set()
+    names.update(SERVER_COMMANDS)
     try:
         names.update(_RESERVED_CMDS)
     except Exception:
@@ -1474,15 +1353,10 @@ def _tabcomp__all_cvar_names() -> list[str]:
     return sorted(out, key=str.lower)
 
 def _tabcomp__all_alias_names() -> list[str]:
-    """
-    Server/local aliases captured on CURRENT_CLIENT (exact keys as shown by aliaslist).
-    """
     try:
-        if CURRENT_CLIENT and getattr(CURRENT_CLIENT, "aliases", None):
-            return sorted(list(CURRENT_CLIENT.aliases.keys()), key=str.lower)
-    except Exception:
-        pass
-    return []
+        return sorted(cvar_system.command_aliases, key=str.lower)
+    except NameError:
+        return []
 
 def _startswith_ci(hay: str, needle: str) -> bool:
     return hay.casefold().startswith((needle or "").casefold())
@@ -1710,13 +1584,14 @@ def _autosave_config(silent: bool = False):
         if not silent and _dev_enabled():
             print(f"⚠️  Autosave error: {e}")
 
-def _set_current_client(c: "AsyncClient|None") -> None:
+def _set_current_client(c: "AsyncClient|None", *, reset_idle: bool = True) -> None:
     global CURRENT_CLIENT
     CURRENT_CLIENT = c
     try:
         _ensure_cl_idle_cvar()
         _ensure_timeout_cvars()
-        _IDLE_RECONNECT.on_client_changed()
+        if reset_idle:
+            _IDLE_RECONNECT.on_client_changed()
         _ensure_idle_reconnect_task()
     except Exception:
         pass
@@ -2338,7 +2213,8 @@ def _compose_sysinfo_line():
 def _print_cmdlist():
     """Print unified command list for the interactive console."""
     print("\nCommands:")
-    print("  (chat)              - Just type and press Enter to chat")
+    print("  (input)             - Commands by default; use say/s for chat")
+    print("  cl_chatmode 0..3    - 0=commands, 1=auto chat, 2=chat-first, 3=space chats")
     print("  help                - Show this command list")
     print("  version             - Show client version tag")
     print("  echo <text>         - Print text locally")
@@ -2360,6 +2236,11 @@ def _print_cmdlist():
     print("  cmd <args>          - Forward command to server (special-cases: protocols, pext)")
     print("  cmdlist             - Show this command list")
     print("  aliaslist           - Show current aliases")
+    print("  alias NAME \"BODY\"   - Define a persistent command alias")
+    print("  cfg_save_aliases 0/1 - Save aliases with archived settings (default 1)")
+    print("  set/seta VAR VALUE  - Set a variable; seta also saves it")
+    print("  writeconfig [file]  - Save settings and aliases")
+    print("  execconfig [file]   - Execute config commands (default config.cfg)")
     print("  connect H[:P]|last  - Connect to host[:port] (default port 26000) or last")
     print("  disconnect          - Disconnect but keep client running")
     print("  reconnect           - Disconnect, then reconnect to the last server")
@@ -2432,6 +2313,9 @@ class _IdleReconnectManager:
 
     async def _loop(self):
         while True:
+            if _CONSOLE_SESSION is not None and _CONSOLE_SESSION.connecting:
+                await asyncio.sleep(1.0)
+                continue
             try:
                 _ensure_cl_idle_cvar()
                 minutes = int(cvar_system.get_value("cl_idle", 0))
@@ -2480,43 +2364,7 @@ def _ensure_idle_reconnect_task():
         # no running loop yet; it will be started the next time a loop exists
         pass
 
-def _invoke_alias_if_any(raw: str) -> bool:
-    """
-    If `raw` is exactly the name of a known alias, queue its body into the
-    command buffer and return True. Uses same conflict handling as unalias:
-    exact match, then '<name>_a' for reserved collisions, then case-insensitive.
-    """
-    if not CURRENT_CLIENT:
-        return False
-    name = (raw or "").strip()
-    if not name or (" " in name):
-        return False  # only bare single tokens invoke aliases, Quake-style
-    aliases = getattr(CURRENT_CLIENT, "aliases", None) or {}
-    key = None
-    if name in aliases:
-        key = name
-    elif name.lower() in _RESERVED_CMDS and (name + "_a") in aliases:
-        key = name + "_a"
-    else:
-        # case-insensitive fallback
-        for k in aliases.keys():
-            if k.lower() == name.lower():
-                key = k
-                break
-    if key is None:
-        return False
-    try:
-        body = "\n".join(CURRENT_CLIENT._expand_alias(key) or []).strip()
-    except ClientError as exc:
-        CON.write(str(exc))
-        return True
-    if not body:
-        return True  # alias exists but empty; still "handled"
-    # Queue the alias body so ';' and 'wait' behave correctly
-    Cbuf_InsertText(body)
-    return True
-
-def _handle_local_command(line: str) -> bool:
+async def _handle_local_command(line: str) -> bool:
     """Return True if we handled it locally (and nothing should be sent to server)."""
     raw = (line or "").strip()
     if not raw:
@@ -2524,78 +2372,12 @@ def _handle_local_command(line: str) -> bool:
         return True
     DBG(f"input: {raw!r}")
 
-    # --- single-token alias invocation (e.g., "last") ---
-    # Do this early so aliases behave like in classic engines.
-    if CURRENT_CLIENT and _invoke_alias_if_any(raw):
-        return True
-
     low = raw.lower()
     # --- info extensions from server (and for manual testing) ---
     # Accept both forms: fullserverinfo/svi/fui/ui and //fullserverinfo//svi//fui//ui
     if re.match(r'^\s*(//)?(fullserverinfo|svi|fui|ui)\b', raw, flags=re.IGNORECASE):
         if CURRENT_CLIENT and CURRENT_CLIENT._handle_info_stufftext(raw):
             return True
-
-    # --- semi-colon batching: run via command buffer so 'wait' works in one-liners ---
-    if _split_queued_commands(raw) != [raw]:
-        Cbuf_AddText(raw)
-        return True
-
-    # --- cmd <args> : forward args to server (strip the "cmd ") ---
-    # This makes aliases like  alias last "cmd last"  work reliably.
-    m_cmd = re.match(r'(?i)^\s*cmd\s+(.+?)\s*$', raw)
-    if m_cmd:
-        args = m_cmd.group(1)
-        if CURRENT_CLIENT and CURRENT_CLIENT._alive and not CURRENT_CLIENT.disconnected:
-            try:
-                asyncio.create_task(CURRENT_CLIENT.send_command(args))
-            except Exception:
-                pass
-        else:
-            CON.write(f"(offline) {args}")
-        return True
-
-    # --- wait [n]: mark to defer remainder (handled by cbuf, but keep for direct calls) ---
-    m_wait = re.match(r'(?i)^\s*wait(?:\s+(\d+))?\s*$', raw)
-    if m_wait:
-        # Put a token in the buffer so sequences like "wait; say hi" still work
-        Cbuf_AddText(raw)
-        return True
-
-    # --- unalias <name> : delete alias (johnfitz) ---
-    m_unalias = re.match(r'(?i)^\s*unalias(?:\s+(\S+))?\s*$', raw)
-    if m_unalias:
-        name = (m_unalias.group(1) or "").strip()
-        if not name:
-            CON.write("unalias <name> : delete alias")
-            return True
-        # operate on the connected client's alias table
-        if not CURRENT_CLIENT:
-            CON.write(f"No alias named {name}")
-            return True
-        aliases = getattr(CURRENT_CLIENT, "aliases", None) or {}
-        # exact match first
-        if name in aliases:
-            aliases.pop(name, None)
-            return True
-        # handle reserved-name remap (server alias stored as "<name>_a")
-        if name.lower() in _RESERVED_CMDS:
-            alt = f"{name}_a"
-            if alt in aliases:
-                aliases.pop(alt, None)
-                return True
-        # final: case-sensitive behavior like strcmp; not found
-        CON.write(f"No alias named {name}")
-        return True
-
-    # --- unaliasall : delete all aliases (johnfitz) ---
-    if re.match(r'(?i)^\s*unaliasall\s*$', raw):
-        if CURRENT_CLIENT:
-            try:
-                CURRENT_CLIENT.aliases.clear()
-            except Exception:
-                pass
-        return True
 
     # --- net_stats [*] : print client-side network counters ---
     m_nstats = re.match(r'(?i)^\s*net_stats(?:\s+(\S+))?\s*$', raw)
@@ -2656,7 +2438,7 @@ def _handle_local_command(line: str) -> bool:
         # send
         if CURRENT_CLIENT and CURRENT_CLIENT._alive and not CURRENT_CLIENT.disconnected:
             cmd = "say_team" if team else "say"
-            asyncio.create_task(CURRENT_CLIENT.send_command(f"{cmd} {pick}"))
+            await CURRENT_CLIENT.send_command(f"{cmd} {pick}")
         else:
             prefix = "👪" if team else "💬"
             CON.write(f"{prefix} {pick}")
@@ -2691,7 +2473,7 @@ def _handle_local_command(line: str) -> bool:
             CON.write("usage:\n  s <message>   — alias for 'say'\n")
             return True
         if CURRENT_CLIENT and CURRENT_CLIENT._alive and not CURRENT_CLIENT.disconnected:
-            asyncio.create_task(CURRENT_CLIENT.send_command(f"say {msg}"))
+            await CURRENT_CLIENT.send_command(f"say {msg}")
         else:
             CON.write(f"💬 You: {msg}")
         return True
@@ -2704,7 +2486,7 @@ def _handle_local_command(line: str) -> bool:
             CON.write("usage:\n  st <message>  — alias for 'say_team'\n")
             return True
         if CURRENT_CLIENT and CURRENT_CLIENT._alive and not CURRENT_CLIENT.disconnected:
-            asyncio.create_task(CURRENT_CLIENT.send_command(f"say_team {msg}"))
+            await CURRENT_CLIENT.send_command(f"say_team {msg}")
         else:
             CON.write(f"👪 TEAM • You: {msg}")
         return True
@@ -2731,7 +2513,7 @@ def _handle_local_command(line: str) -> bool:
             # Fallback manual loop if needed
             try:
                 for cv in list(getattr(cvar_system, "_cvars", {}).values()):
-                    cv.reset()
+                    cvar_system.reset(cv.name)
             except Exception:
                 pass
         return True
@@ -2741,7 +2523,7 @@ def _handle_local_command(line: str) -> bool:
         try:
             for cv in list(getattr(cvar_system, "_cvars", {}).values()):
                 if cv.flags & CvarFlags.ARCHIVE:
-                    cv.reset()
+                    cvar_system.reset(cv.name)
         except Exception:
             pass
         return True
@@ -2763,8 +2545,8 @@ def _handle_local_command(line: str) -> bool:
         # If connected, announce via say; else print locally
         if CURRENT_CLIENT and CURRENT_CLIENT._alive and not CURRENT_CLIENT.disconnected:
             try:
-                asyncio.create_task(CURRENT_CLIENT.send_command(f"say randomize: {args_string}"))
-                asyncio.create_task(CURRENT_CLIENT.send_command(f"say result: {picked}"))
+                await CURRENT_CLIENT.send_command(f"say randomize: {args_string}")
+                await CURRENT_CLIENT.send_command(f"say result: {picked}")
             except Exception:
                 # Fallback local print if networking fails
                 CON.write(f"result: ^m{picked}^m")
@@ -2826,18 +2608,6 @@ def _handle_local_command(line: str) -> bool:
             )
         return True
 
-    # --- __cfgmarker: end of config execution sentinel ---
-    if low == "__cfgmarker":
-        globals()["IN_CFG_EXEC"] = False
-        return True
-
-    # --- exec <filename>: execute a script file locally (no server forward) ---
-    m_exec = re.match(r'(?i)^\s*exec\s+(.+?)\s*$', raw)
-    if m_exec:
-        path = m_exec.group(1)
-        _exec_script_command(path)
-        return True
-
     # --- echo: print the rest of the line locally (no server forward) ---
     m_echo = re.match(r'(?i)^\s*echo(?:\s+(.*))?$', raw)
     if m_echo:
@@ -2864,28 +2634,22 @@ def _handle_local_command(line: str) -> bool:
     m_edit = re.match(r'(?i)^\s*aliasedit\s+(\S+)\s*$', raw)
     if m_edit:
         alias_name = m_edit.group(1)
-        if not CURRENT_CLIENT:
-            CON.write("⚠️  Not connected; no aliases loaded.")
-            return True
         # Exact match, then conflict-renamed "<name>_a", then case-insensitive
-        body = CURRENT_CLIENT.aliases.get(alias_name)
+        body = cvar_system.command_aliases.get(alias_name)
         key_used = alias_name
         if body is None:
-            if alias_name + "_a" in CURRENT_CLIENT.aliases:
+            if alias_name + "_a" in cvar_system.command_aliases:
                 key_used = alias_name + "_a"
-                body = CURRENT_CLIENT.aliases[key_used]
+                body = cvar_system.command_aliases[key_used]
             else:
-                for k, v in CURRENT_CLIENT.aliases.items():
+                for k, v in cvar_system.command_aliases.items():
                     if k.lower() == alias_name.lower():
                         key_used, body = k, v
                         break
         if body is None:
             CON.write(f'\nno alias named "{alias_name}" found\n')
             return True
-        # Clean trailing newline and escape quotes
-        cleaned = body.rstrip("\n")
-        cleaned = cleaned.replace('"', '\\"')
-        final_cmd = f'alias "{alias_name}" "{cleaned}"'
+        final_cmd = f"alias {quote_arg(alias_name)} {quote_arg(body.rstrip())}"
 
         # Try to prefill the *next* input line using readline (POSIX).
         def _prefill_next_input(s: str) -> bool:
@@ -2898,6 +2662,7 @@ def _handle_local_command(line: str) -> bool:
                         _readline.set_pre_input_hook(None)
                 try:
                     _readline.set_pre_input_hook(_hook)
+                    globals()["_EDIT_PREFILL"] = True
                     return True
                 except Exception:
                     pass
@@ -2923,19 +2688,6 @@ def _handle_local_command(line: str) -> bool:
             CON.write("]" + final_cmd)
         return True
 
-    # Expand captured aliases (server-sent or local) *before* we decide what to forward.
-    # Skip when the user is asking about aliases ("alias ...").
-    if not low.startswith("alias ") and CURRENT_CLIENT:
-        try:
-            cmds = CURRENT_CLIENT._expand_alias(raw)
-            if cmds:
-                # Fire each expanded command; impulse lines will be handled specially in send_command().
-                for c in cmds:
-                    asyncio.create_task(CURRENT_CLIENT.send_command(c))
-                return True
-        except Exception:
-            pass
-
     if low == "infotest":
         _do_infotest()
         return True
@@ -2950,9 +2702,12 @@ def _handle_local_command(line: str) -> bool:
 
     # rcon <args...>  -> uses rcon_password cvar
     m = re.match(r"(?i)^rcon(?:\s+(.*))?$", raw)
-    if m and CURRENT_CLIENT:
+    if m:
         args = (m.group(1) or "").strip()
-        asyncio.create_task(CURRENT_CLIENT.send_rcon_nq(args))
+        if CURRENT_CLIENT and not CURRENT_CLIENT.disconnected:
+            await CURRENT_CLIENT.send_rcon_nq(args)
+        else:
+            CON.write("Not connected.")
         return True
 
     return False
@@ -2986,8 +2741,7 @@ def _apropos_search(substr: str) -> None:
         # Aliases (server/local)
         aliases = []
         try:
-            if CURRENT_CLIENT and CURRENT_CLIENT.aliases:
-                aliases = sorted([k for k in CURRENT_CLIENT.aliases.keys() if needle in k.casefold()])
+            aliases = sorted([k for k in cvar_system.command_aliases if needle in k.casefold()])
         except Exception:
             pass
 
@@ -3003,76 +2757,6 @@ def _apropos_search(substr: str) -> None:
             CON.write(f"Aliases ({len(aliases)}): " + ", ".join(aliases))
     except Exception as e:
         CON.write(f"find error: {e}")
-
-# -------------------- exec helpers --------------------
-def _exec_script_command(path: str) -> None:
-    """
-    Implements: exec <filename>
-      - prints 'execing <file>' when cmd_warncmd=1
-      - on failure prints 'couldn't exec <file>' when cmd_warncmd=1
-      - when file=='default.cfg' and not found, uses DEFAULT_CFG if set
-      - executes commands in-order; unknown lines are sent as string commands (not chat)
-      - sets IN_CFG_EXEC during processing; cleared by a trailing __cfgmarker
-    """
-    # Read file (expand ~, relative paths)
-    fn = (path or "").strip()
-    warn = bool(cvar_system.get_bool("cmd_warncmd", True))
-
-    data: Optional[str] = None
-    try:
-        with open(os.path.expanduser(fn), "r", encoding="latin-1") as f:
-            data = f.read()
-    except Exception:
-        # special default.cfg fallback
-        if fn == "default.cfg" and isinstance(DEFAULT_CFG, str):
-            data = DEFAULT_CFG
-
-    if data is None:
-        if warn:
-            CON.write(f"couldn't exec {fn}")
-        return
-
-    if warn:
-        CON.write(f"execing {fn}")
-
-    # Ensure the cvar exists for future toggles (bool, archived)
-    try:
-        if cvar_system.find("cmd_warncmd") is None:
-            cvar_system.register(Cvar("cmd_warncmd", "1", flags=CvarFlags.ARCHIVE, cvar_type=CvarType.BOOL,
-                                      description="Warn/echo exec() actions"))
-    except Exception:
-        pass
-
-    # Mark "in config exec"
-    globals()["IN_CFG_EXEC"] = True
-
-    # Insert a newline "just in case there was no trailing \\n." (Quake behavior)
-    if data and not data.endswith("\n"):
-        data = data + "\n"
-
-    # Split into commands; treat semicolons/newlines as separators (naive like our alias splitter)
-    cmds = _split_queued_commands(data)
-    for cmd in cmds:
-        s = cmd.strip()
-        if not s:
-            continue
-        # Skip pure '//' comment lines
-        if s.startswith("//"):
-            continue
-        # Try local handling first
-        if _handle_local_command(s):
-            continue
-        # From configs, do NOT treat unknown tokens as chat; send as string command to server if connected.
-        if CURRENT_CLIENT:
-            try:
-                asyncio.create_task(CURRENT_CLIENT.send_command(s))
-            except Exception:
-                pass
-        # else: silently ignore unknowns when offline, matching common engine leniency
-
-    # Queue a marker to clear IN_CFG_EXEC after the script batch
-    # (execute immediately in our synchronous flow)
-    _handle_local_command("__cfgmarker")
 
 # -------------------- IP helpers --------------------
 def _primary_local_ip() -> Optional[str]:
@@ -3194,24 +2878,6 @@ def _sayrand_ensure_loaded(slot: int) -> None:
     _sayrand_msgs[slot] = msgs
     _sayrand_order[slot] = []
     _sayrand_next[slot] = 0
-
-def _is_raw_server_command(line: str) -> bool:
-    """
-    Return True if the input should be forwarded as a raw server command
-    instead of being treated as chat. (say_team is handled separately.)
-    """
-    l = line.strip()
-    if not l:
-        return False
-    low = l.lower()
-    if low in {"status", "players", "kill", "ping", "cmd"}:
-        return True
-    if re.match(r"^(impulse|name|color|say)\b", l, flags=re.IGNORECASE):
-        return True
-    if re.match(r"^(say_team)\b", l, flags=re.IGNORECASE):
-        return True
-    return False
-
 
 def _clear_console():
     """Clear the terminal/console screen cross-platform."""
@@ -3484,7 +3150,7 @@ class AsyncClient:
         self.last_chat_is_team: bool = False
         self._last_like_at: float = self._mono0 - 10.0  # rate-limit (>=1s)
 
-        self.aliases: dict[str, str] = {}  # server/local aliases live here
+        self.aliases = cvar_system.command_aliases if "cvar_system" in globals() else {}
         # subscribe cvar updates to push userinfo on change
         self._cvar_subscribed = False
 
@@ -4147,18 +3813,16 @@ class AsyncClient:
                                     self._myinfo_is[k] = v
                                     DBG_ONCE(f"setinfo-{k}", f"setinfo {k}={v!r}")
                             # (fall through to alias capture as you already had)
-                            m_alias = re.match(r"^\s*alias\s+(\S+)\s+(.*)$", line, flags=re.IGNORECASE)
-                            if not m_alias:
-                                continue
-                            name = m_alias.group(1)
-                            body = _strip_quotes(m_alias.group(2).strip())
-                            if not name:
-                                continue
-                            # Light conflict policy: if it shadows a reserved client command, append _a
-                            final_name = name
-                            if final_name.lower() in _RESERVED_CMDS:
-                                final_name = f"{final_name}_a"
-                            self.aliases[final_name] = body
+                            if re.match(r"(?i)^\s*alias\s", line):
+                                alias_tokens = shlex.split(line)
+                                if len(alias_tokens) >= 3:
+                                    cvars = globals().get("cvar_system")
+                                    define_alias(
+                                        self.aliases, alias_tokens[1], " ".join(alias_tokens[2:]),
+                                        reserved=lambda key: key in _RESERVED_CMDS or
+                                        (cvars is not None and key in cvars._commands),
+                                        is_cvar=lambda key: cvars is not None and cvars.find(key) is not None,
+                                        allow_overlap=cvars.get_bool("cl_aliasoverlap") if cvars is not None else False)
                     except Exception:
                         # Bad alias lines should never kill the RX loop
                         pass
@@ -4766,52 +4430,6 @@ class AsyncClient:
     def joequake_version(self):
         return self._conn.joequake_version
 
-    # ---------------- Alias expansion ----------------
-    def _expand_alias(self, line: str, depth: int = 0) -> list[str] | None:
-        """
-        If `line` begins with a known alias, expand it and return a list of
-        concrete commands to send. Supports $0, $1..$9, and $*; recurses with cap.
-        """
-        try:
-            toks = shlex.split(line)
-        except Exception:
-            toks = line.strip().split()
-        if not toks:
-            return None
-        name, *args = toks
-        body = self.aliases.get(name)
-        if body is None:
-            return None
-        if depth >= ALIAS_MAX_DEPTH:
-            raise ClientError(f"Alias expansion exceeded {ALIAS_MAX_DEPTH} levels: {name}")
-
-        # $-parameter substitution
-        def _sub_param(m: re.Match) -> str:
-            key = m.group(1)
-            if key == '*':
-                return ' '.join(args)
-            if key == '0':
-                return name
-            if key.isdigit():
-                idx = int(key) - 1
-                return args[idx] if 0 <= idx < len(args) else ''
-            return ''
-
-        expanded = re.sub(r'\$(\*|[0-9])', _sub_param, body)
-        # If no parameters used but args exist, append args
-        if ('$' not in body) and args:
-            expanded = (expanded + ' ' + ' '.join(args)).strip()
-
-        cmds = _split_queued_commands(expanded)
-        out: list[str] = []
-        for c in cmds:
-            nested = self._expand_alias(c, depth + 1)
-            if nested:
-                out.extend(nested)
-            else:
-                out.append(c)
-        return out
-
     async def _send_heartbeat(self, impulse: int | None = None, reliable: bool = False):
         """
         Send a tiny clc_move immediately to tick server lastMessageTime.
@@ -5197,10 +4815,8 @@ async def _stop_tasks(*tasks):
 
 async def _aioclient(args=None):
     args = _parse_cli_args() if args is None else args
-    host, port, enable_demo = args.host, args.port, args.demo
-
     # ---------- Initialize CVAR system (must happen before config loading) ----------
-    global cvar_system
+    global cvar_system, _CONSOLE_SESSION
     cvar_system = CvarSystem()
     # a couple of example/handy client cvars (feel free to add more)
     cvar_system.register(Cvar("cl_rate", "10000", CvarFlags.USERINFO, cvar_type=CvarType.INT,
@@ -5249,723 +4865,29 @@ async def _aioclient(args=None):
             cvar_system.register(Cvar("bottomcolor", "0",
                 CvarFlags.USERINFO | CvarFlags.ARCHIVE, callback=_on_color_changed))
 
-        if cvar_system.load_config("config.cfg"):
-            print("execing config.cfg")
     except Exception:
         pass
-
-    print(f"🔗 Connecting to {host}:{port}...")
-
-    # --- Ensure userinfo CVARs exist before connecting (so we can push them) ---
+    _CONSOLE_SESSION = session = ConsoleSession(sys.modules[__name__])
+    session.enable_demo = args.demo
     try:
-        # Register CVARs (migrate 'name' to STRING if previously mis-typed)
-        cv_name = cvar_system.find("name")
-        if cv_name is None or cv_name.type is not CvarType.STRING:
-            old_name_val = (cv_name.string if cv_name else "pyquake-m")
+        if os.path.exists(cvar_system._config_file):
+            await cvar_system.load_config()
+        if not session.dispatcher.stopped and session.client is None:
+            await session.dispatcher.execute(f"connect {quote_arg(f'{args.host}:{args.port}')}", source="startup")
+        while not session.dispatcher.stopped:
+            _INPUT_ACTIVE.set()
             try:
-                # remove wrong-typed var so we can re-register correctly
-                cvar_system.unregister_variable("name")
-            except Exception:
-                pass
-            cvar_system.register(Cvar(
-                "name",
-                old_name_val,
-                CvarFlags.USERINFO | CvarFlags.ARCHIVE,
-                callback=_on_name_changed,
-                cvar_type=CvarType.STRING
-            ))
-        if cvar_system.find("topcolor") is None:
-            cvar_system.register(Cvar("topcolor", "0", CvarFlags.USERINFO | CvarFlags.ARCHIVE,
-                                      callback=_on_color_changed))
-        if cvar_system.find("bottomcolor") is None:
-            cvar_system.register(Cvar("bottomcolor", "0", CvarFlags.USERINFO | CvarFlags.ARCHIVE,
-                                      callback=_on_color_changed))
-    except NameError:
-        # CVAR system not available; continue without CVAR-backed userinfo.
-        pass
-
-    try:
-        client = await AsyncClient.connect(host, port)
-        client._bind_cvar_subscriptions()
-    except Exception as e:
-        print(f"Connection failed: {e}")
-        return
-
-    # Allow callbacks to reach the live connection
-    _set_current_client(client)
-
-    # Enable demo recording if requested
-    if enable_demo:
-        demo = client.record_demo()
-        print("Demo recording enabled")
-    else:
-        demo = None
-    # Track current/last targets for 'connect last'
-    last_connect_spec = f"{host}:{port}"
-
-    try:
-        # Start keepalive (clc_move @10Hz) ONCE; also gentle kickstart once
-        hb_task = asyncio.create_task(_simple_keep_alive(client))
-        chatinfo_task = asyncio.create_task(_watch_chatinfo(client))
-        kick_task = asyncio.create_task(_kickstart_handshake(client))
-        guard_task = asyncio.create_task(_connection_guard(client))
-
-        try:
-            await asyncio.wait_for(client.wait_until_spawn(), timeout=30.0)
-        except asyncio.TimeoutError:
-            print("Spawn timeout; continuing anyway. You can still send commands.")
-
-        # (name/color already sent during signon 1)
-
-        # Send one initial tiny move (some servers expect immediate activity)
-        try:
-            p, y, r = client.angles
-        except Exception:
-            p = y = r = 0.0
-        client.move(p, y, r, 1, 0, 0, 0, 0)  # first move; subsequent keepalive uses framed micro-moves
-
-        # Tasks already running (no duplicates)
-
-        # Interactive command loop
-        while True:
-            try:
-                # Get command from user input; mark console-as-chat while waiting
-                loop = asyncio.get_event_loop()
-                _INPUT_ACTIVE.set()
-                try:
-                    cmd = await loop.run_in_executor(None, input, "> ")
-                finally:
-                    _INPUT_ACTIVE.clear(); _mark_activity()
-
-                line = cmd.strip()
-                if _handle_local_command(line):
-                    continue
-
-                if line.lower() in ['quit', 'exit', 'q']:
-                    break
-
-                elif line.lower() in ('help', 'cmdlist'):
-                    _print_cmdlist()
-                    continue
-
-                elif line.lower() == 'aliaslist':
-                    if client.aliases:
-                        print("\nCurrent aliases:")
-                        for name, body in sorted(client.aliases.items()):
-                            print(f"  {name} = {body}")
-                        print("")
-                    else:
-                        print("No aliases defined.")
-                    continue
-
-                elif line.lower() == 'clear':
-                    CON.clear()  # Con_Clear_f: wipe buffer + reset backscroll, no chatter
-                    continue
-
-                elif re.match(r"^\s*condump(\s+.+)?\s*$", line, flags=re.IGNORECASE):
-                    # Syntax: condump [filename]; default is condump.txt
-                    try:
-                        m = re.match(r"^\s*condump(?:\s+(.+))?\s*$", line, flags=re.IGNORECASE)
-                        fn = (m.group(1).strip() if m and m.group(1) else "condump.txt")
-                    except Exception:
-                        fn = "condump.txt"
-                    ok = CON.dump(fn)
-                    if not ok:
-                        print("condump failed.")
-                    # No server interaction; continue input loop
-                    continue
-
-                elif line.lower() == 'demo':
-                    if demo is None:
-                        demo = client.record_demo()
-                        print("📹 Demo recording started")
-                    else:
-                        print("📹 Demo already recording")
-
-                elif line.lower().strip() in ("showscores", "scoreboard"):
-                    if client.disconnected or not client._alive:
-                        CON.write('🔌 Not connected. Use: connect host[:port]')
-                        continue
-
-                    # Build rows keyed by canonical name to avoid duplicates (case/format diffs)
-                    rows_by_key: dict[str, tuple[int,int,str,str,str]] = {}
-                    # Ensure we have recent ping data
-                    if not any(isinstance(r.get("ping"), int) for r in client._score_state.values()):
-                        try:
-                            await client.refresh_pings_via_ping(timeout=1.0)
-                        except Exception:
-                            pass
-
-                    # 1) Start with active slots that have a resolved ping
-                    for idx in sorted(client._score_state.keys()):
-                        r = client._score_state[idx]
-                        if not r.get("active"):
-                            continue
-                        nm = r.get("name")
-                        pg = r.get("ping")
-                        if not (nm and isinstance(pg, int)):
-                            continue
-                        fr = int(r.get("frags", 0))
-                        st = _status_from_names(nm, r.get("name_full", ""))
-                        _merge_score_row(rows_by_key, fr, int(pg), st, nm, _name_key(nm))
-
-                    # 2) Merge in any pings we learned from the silent sweep for names
-                    #    that aren't present in _score_state yet (covers "us" edge case).
-                    for nm, pg in client._latest_ping_by_name.items():
-                        fr = 0
-                        st = ""
-                        nm_k = _name_key(nm)
-                        # if we already know frags/status via a slot with same canonical name, use that
-                        for r in client._score_state.values():
-                            if r.get("active") and _name_key(r.get("name","")) == nm_k:
-                                fr = int(r.get("frags", 0))
-                                st = _status_from_names(r.get("name", ""), r.get("name_full", ""))
-                                break
-                        _merge_score_row(rows_by_key, fr, int(pg), st, nm, nm_k)
-
-                    rows = list(rows_by_key.values())
-
-                    if not rows:
-                        STATUS_W = 15  # status tail can use the full 15 chars
-                        hdr = f'{"ping":>5}  {"frags":>5}  {"name":<15}  {"status":<{STATUS_W}}'
-                        width = len(hdr)
-                        print("\n" + _rule_with_title("Scoreboard", width))
-                        print("  (no players with ping yet)")
-                        print("=" * width + "\n")
-                        continue
-
-                    # Sort & render
-                    rows.sort(key=lambda t: (t[0], -t[1]), reverse=True)  # frags desc, then lower ping
-                    me = _sanitize_player_name(cvar_system.get_string("name", "pyquake-m"))
-                    me_k = _name_key(me)
-                    STATUS_W = 15
-                    hdr = f'{"ping":>5}      {"frags":>5}  {"name":<15}  {"status":<{STATUS_W}}'
-                    width = len(hdr)
-                    # Title/rule spans the *exact* header width
-                    print("\n" + _rule_with_title("Scoreboard", width))
-                    print(hdr)
-                    for fr, pg, st, nm, nm_k in rows:
-                        # Resolve pants color and emoji
-                        bottom_val = _bottom_for_name_key(client._score_state, nm_k)
-                        # Fallback to our own CVAR color for our row if still unknown
-                        if bottom_val is None:
-                            bottom_val = _maybe_self_bottom(client, nm_k)
-                        pants_emoji = _pants_color_emoji(bottom_val)
-                        # Put the arrow right after the name (inside the name column),
-                        # and leave TWO spaces between emoji and name.
-                        name_disp = nm + (" ◀" if nm_k == me_k else "")
-                        print(
-                            f"{pg:>5}   {fr:>5} {pants_emoji}  "
-                            f"{name_disp:<15}  {st[:STATUS_W]:<{STATUS_W}}"
-                        )
-                    # Add ProQuake timer/team footer
-                    CON.write("")  # blank line before the footer
-                    try:
-                        line = client.format_showscores_footer(width)
-                        if line:
-                            CON.write(line)
-                    except Exception:
-                        pass
-                    print("=" * width + "\n")
-                    continue
-
-                elif line:
-                    # Optional leading slash support; not required anymore
-                    raw = line.lstrip()
-                    if raw.startswith('/'):
-                        raw = raw[1:].lstrip()
-
-                    # -------------- CVAR commands --------------
-                    # set/seta/unset/toggle
-                    m_cvarcmd = re.match(r"^\s*(seta?|unset|toggle|cvarlist|writeconfig|execconfig)\b(.*)$", raw, flags=re.IGNORECASE)
-                    if m_cvarcmd:
-                        cmdw = m_cvarcmd.group(1).lower()
-                        rest = (m_cvarcmd.group(2) or "").strip()
-                        # cvarlist [pattern]
-                        if cmdw == "cvarlist":
-                            pat = rest
-                            rows = cvar_system.list_cvars(pat)
-                            if not rows:
-                                print("(no cvars)")
-                            else:
-                                for mark, nm, val in rows:
-                                    print(f"{mark} {nm} : {val}")
-                            continue
-                        # writeconfig [file]
-                        if cmdw == "writeconfig":
-                            fn = rest if rest else "config.cfg"
-                            ok = cvar_system.write_variables(fn)
-                            print(f"wrote {fn}" if ok else f"failed writing {fn}")
-                            continue
-                        # execconfig [file]
-                        if cmdw == "execconfig":
-                            fn = rest if rest else "config.cfg"
-                            ok = cvar_system.load_config(fn)
-                            print(f"execed {fn}" if ok else f"failed exec {fn}")
-                            continue
-                        # parse: <var> [value]
-                        try:
-                            parts = shlex.split(rest)
-                        except Exception:
-                            parts = rest.split()
-                        if not parts:
-                            print("usage: set[a]/unset/toggle <var> [value]")
-                            continue
-                        var, *val_parts = parts
-                        if cmdw in ("set","seta"):
-                            val = " ".join(val_parts) if val_parts else ""
-                            cv = cvar_system.find(var)
-                            if not cv:
-                                flags = CvarFlags.USERDEFINED
-                                if cmdw == "seta":
-                                    flags |= CvarFlags.ARCHIVE | CvarFlags.SETA
-                                # default to STRING for user-defined vars
-                                cv = cvar_system.create(var, val, flags=flags, cvar_type=CvarType.STRING)
-                                if not cv:
-                                    print(f"couldn't create {var}")
-                                    continue
-                            else:
-                                if cmdw == "seta":
-                                    cv.flags |= (CvarFlags.ARCHIVE | CvarFlags.SETA)
-                            cvar_system.set(cv.name, val)
-                            continue
-                        if cmdw == "unset":
-                            cv = cvar_system.find(var)
-                            if not cv:
-                                print(f"{var}: not found")
-                            else:
-                                cvar_system.reset(cv.name)
-                            continue
-                        if cmdw == "toggle":
-                            cv = cvar_system.find(var)
-                            if not cv:
-                                # create boolean if absent
-                                cv = cvar_system.create(var, "0", flags=CvarFlags.USERDEFINED, cvar_type=CvarType.BOOL)
-                            newv = "0" if (cv.as_bool()) else "1"
-                            cvar_system.set(cv.name, newv)
-                            continue
-
-                    # -------- name / color commands -> go through CVARs --------
-                    # `name` with/without argument
-                    if re.match(r"^\s*name\s*$", raw, flags=re.IGNORECASE):
-                        try:
-                            cvar_system.command(["name"])  # prints current value
-                        except Exception:
-                            # fallback: print from current state
-                            print(f'"name" is "{_sanitize_player_name(cvar_system.get_string("name","pyquake-m"))}"')
-                        continue
-                    m_setname = re.match(r'^\s*name\s+(.+?)\s*$', raw, flags=re.IGNORECASE)
-                    if m_setname:
-                        newn = _strip_quotes(m_setname.group(1).strip())
-                        try:
-                            cvar_system.set("name", newn)
-                        except Exception:
-                            # If CVARs missing, fall back to raw command
-                            await client.send_command(f'name "{_sanitize_player_name(newn)}"')
-                        continue
-
-                    # `color` with/without args
-                    if re.match(r"^\s*color\s*$", raw, flags=re.IGNORECASE):
-                        try:
-                            top = int(cvar_system.get_value("topcolor", 0))
-                            bot = int(cvar_system.get_value("bottomcolor", 0))
-                        except Exception:
-                            top = bot = 0
-                        print(f'"color" is "{top} {bot}"')
-                        continue
-                    m_setcolor = re.match(r"^\s*color\s+(\d+)\s+(\d+)\s*$", raw, flags=re.IGNORECASE)
-                    if m_setcolor:
-                        t = _clamp_color(int(m_setcolor.group(1)))
-                        b = _clamp_color(int(m_setcolor.group(2)))
-                        try:
-                            cvar_system.set("topcolor", str(t))
-                            cvar_system.set("bottomcolor", str(b))
-                        except Exception:
-                            await client.send_command(f"color {t} {b}")
-                        continue
-
-                    # If the line starts with a known CVAR name, treat as CVAR command:
-                    try:
-                        toks = shlex.split(raw)
-                    except Exception:
-                        toks = raw.split()
-                    if toks:
-                        maybe_cvar = cvar_system.find(toks[0])
-                        if maybe_cvar:
-                            if not cvar_system.command(toks):
-                                print("cvar command error")
-                            continue
-
-                    # -------- like (say/say_team "likes <last chat>") --------
-                    if raw.lower().strip() == "like":
-                        if client.disconnected or not client._alive:
-                            CON.write('🔌 Not connected. Use: connect host[:port]')
-                            continue
-                        now = time.monotonic()
-                        if (now - client._last_like_at) < 1.0:
-                            # simple anti-spam (silent, like engine)
-                            continue
-                        # nothing to like?
-                        if not client.last_chat_msg:
-                            CON.write("nothing to like")
-                            client._last_like_at = now
-                            continue
-                        # avoid liking a like
-                        if re.search(r"\blikes\b", client.last_chat_msg, flags=re.IGNORECASE):
-                            client._last_like_at = now
-                            continue
-                        # sanitize and send
-                        msg_txt = client.last_chat_msg.replace("\r", " ").replace("\n", " ").strip()
-                        if not msg_txt:
-                            client._last_like_at = now
-                            continue
-                        cmd_out = ("say_team " if client.last_chat_is_team else "say ") + f"likes {msg_txt}"
-                        await client.send_command(cmd_out)
-                        CON.write(f"👍 Liked: {msg_txt}")
-                        client._last_like_at = now
-                        continue
-
-                    # -------- tell / dm / pm (private message) --------
-                    # Syntax: tell WHO MSG
-                    #  - WHO may be a name (supports server-side wildcards), or '#N' / 'N' for scoreboard index
-                    #  - We forward as: tell <WHO> <MSG>
-                    m_tell = re.match(
-                        r"^\s*(tell|dm|pm)\s+(\"[^\"]+\"|'[^']+'|\S+)\s+(.+)$",
-                        raw, flags=re.IGNORECASE
-                    )
-                    if m_tell:
-                        if client.disconnected or not client._alive:
-                            CON.write('🔌 Not connected. Use: connect host[:port]')
-                            continue
-                        who = m_tell.group(2)
-                        msg = m_tell.group(3).strip()
-                        who = _strip_quotes(who)
-                        # Support numeric indices: "7" -> "#7", keep "#7" as-is
-                        if re.fullmatch(r"#?\d+", who):
-                            try:
-                                idx = int(who.lstrip("#"))
-                                who = f"#{idx}"
-                            except Exception:
-                                pass
-                        # Guard against empty message after trimming
-                        if not msg:
-                            CON.write("Usage: tell WHO MESSAGE")
-                            continue
-                        # Send to server
-                        await client.send_command(f"tell {who} {msg}")
-                        # Local echo
-                        # Avoid leaking IPs or control chars; msg is user-provided
-                        echo_who = who if len(who) < 64 else who[:61] + "..."
-                        echo_msg = msg if len(msg) < 400 else msg[:397] + "..."
-                        CON.write(f"📩 You → {echo_who}: {echo_msg}")
-                        continue
-
-                    # -------- disconnect (keep app running) --------
-                    if raw.lower() == "disconnect":
-                        await _stop_tasks(hb_task, chatinfo_task, kick_task, guard_task)
-                        hb_task = chatinfo_task = kick_task = guard_task = None
-                        # Auto-save before tearing down the connection
-                        try:
-                            # Always autosave, but only *announce* it when developer=1
-                            # (keep the config write quiet so we fully control the message here)
-                            _autosave_config(silent=True)
-                            if _dev_enabled():
-                                try: CON.write("💾 Auto-saved config (manual disconnect).")
-                                except Exception: pass
-                        except Exception: pass
-                        _set_current_client(None)
-                        try:
-                            await client.disconnect()
-                        except Exception:
-                            pass
-                        print("🔌 Disconnected. Use: connect host[:port]  (or  connect last)")
-                        continue
-
-                    # -------- reconnect (reuse last_connect_spec) --------
-                    if raw.lower().strip() == "reconnect":
-                        # Need something to reconnect *to*
-                        target = _parse_hostport_spec(last_connect_spec) if 'last_connect_spec' in locals() and last_connect_spec else None
-                        if not target:
-                            print("ℹ️  No previous server recorded. Use: connect host[:port]")
-                            continue
-                        new_host, new_port = target
-                        # Tear down existing connection (if any)
-                        await _stop_tasks(hb_task, chatinfo_task, kick_task, guard_task)
-                        hb_task = chatinfo_task = kick_task = guard_task = None
-                        _set_current_client(None)
-                        if client:
-                            # Auto-save before reconnect teardown (counts as a disconnect)
-                            try:
-                                _autosave_config()
-                                try: CON.write("💾 Auto-saved config (reconnect).")
-                                except Exception: pass
-                            except Exception: pass
-                            try:
-                                await client.disconnect()
-                            except Exception:
-                                pass
-                        # Reconnect to last target
-                        print(f"🔁 Reconnecting to {new_host}:{new_port}...")
-                        try:
-                            client = await AsyncClient.connect(new_host, new_port)
-                            client._bind_cvar_subscriptions()
-                            _set_current_client(client)
-                            # restart background tasks
-                            hb_task = asyncio.create_task(_simple_keep_alive(client))
-                            chatinfo_task = asyncio.create_task(_watch_chatinfo(client))
-                            kick_task = asyncio.create_task(_kickstart_handshake(client))
-                            guard_task = asyncio.create_task(_connection_guard(client))
-                            # keep last_connect_spec unchanged (still points to this target)
-                            try:
-                                await asyncio.wait_for(client.wait_until_spawn(), timeout=20.0)
-                                print("✅ Reconnected & spawned.")
-                            except asyncio.TimeoutError:
-                                print("✅ Reconnected (spawn pending).")
-                        except Exception as e:
-                            print(f"❌ Reconnect failed: {e}")
-                        continue
-
-                    # -------- connect host[:port] / connect last --------
-                    if re.match(r"(?i)^connect(?:\s|$)", raw):
-                        parts = raw.split(maxsplit=1)
-                        if len(parts) == 1 or not parts[1].strip():
-                            print("Usage: connect host[:port]   or   connect last")
-                            continue
-                        spec = parts[1].strip()
-                        if spec.lower() == "last":
-                            target = _parse_hostport_spec(last_connect_spec) if last_connect_spec else None
-                        else:
-                            target = _parse_hostport_spec(spec)
-                        if not target:
-                            print("❌ address is not a valid ip/domain or port")
-                            continue
-                        new_host, new_port = target
-                        # Clean up any existing connection
-                        await _stop_tasks(hb_task, chatinfo_task, kick_task, guard_task)
-                        hb_task = chatinfo_task = kick_task = guard_task = None
-                        _set_current_client(None)
-                        if client:
-                            try: await client.disconnect()
-                            except Exception: pass
-                        print(f"🔗 Connecting to {new_host}:{new_port}...")
-                        try:
-                            client = await AsyncClient.connect(new_host, new_port)
-                            client._bind_cvar_subscriptions()
-                            _set_current_client(client)
-                            # restart background tasks
-                            hb_task = asyncio.create_task(_simple_keep_alive(client))
-                            chatinfo_task = asyncio.create_task(_watch_chatinfo(client))
-                            kick_task = asyncio.create_task(_kickstart_handshake(client))
-                            guard_task = asyncio.create_task(_connection_guard(client))
-                            last_connect_spec = f"{new_host}:{new_port}"
-                            try:
-                                await asyncio.wait_for(client.wait_until_spawn(), timeout=20.0)
-                                print("✅ Connected & spawned.")
-                            except asyncio.TimeoutError:
-                                print("✅ Connected (spawn pending).")
-                        except Exception as e:
-                            print(f"❌ Connect failed: {e}")
-                        continue
-
-                    # ---- Cmd_ForwardToServer-style handling for 'cmd ...' ----
-                    m_cmd = re.match(r"^\s*cmd\b(.*)$", raw, flags=re.IGNORECASE)
-                    if m_cmd:
-                        args = (m_cmd.group(1) or "").strip()
-                        if client.disconnected or not client._alive:
-                            CON.write('Can\'t "cmd", not connected')
-                            continue
-
-                        # Block changing setinfo observer (mirrors the C guard)
-                        if re.match(r"^\s*setinfo\s+observer\b", args, flags=re.IGNORECASE):
-                            CON.write("changing observer key is not allowed")
-                            continue
-
-                        # Special replies for capability queries (sent WITHOUT 'cmd ' prefix)
-                        if args.lower() == "protocols":
-                            # Order by preference; include common extended + classic NQ
-                            proto_line = "protocols 999 666 10002 15"
-                            await client.send_command(proto_line)
-                            continue
-                        if args.lower().startswith("pext"):
-                            await client.send_command("pext 0 0 0 0")
-                            continue
-
-                        # Default: forward just the args (no 'cmd ' prefix)
-                        if args:
-                            await client.send_command(args)
-                        continue
-
-                    # Local 'alias' command (teach the client):
-                    #   alias                   -> list all with count
-                    #   alias <name>            -> show exact; else substring search in names/values (case-insensitive)
-                    #   alias <name> <value...> -> set/replace (rename to <name>_a on command conflict; or CVAR conflict if cl_aliasoverlap=0)
-                    m_local_alias = re.match(r"^\s*alias\b(.*)$", raw, flags=re.IGNORECASE)
-                    if m_local_alias:
-                        rest = m_local_alias.group(1).strip()
-
-                        # 1) No args → list all
-                        if not rest:
-                            count = 0
-                            for n, b in sorted(client.aliases.items(), key=lambda kv: kv[0].lower()):
-                                print(f"   {n}: {b}")
-                                count += 1
-                            if count:
-                                print(f"{count} alias command(s)")
-                            else:
-                                print("no alias commands found")
-                            continue
-
-                        # Parse tokens (name [value...])
-                        try:
-                            parts = shlex.split(rest)
-                        except Exception:
-                            parts = rest.split()
-
-                        # 2) One token → exact show, else substring search
-                        if len(parts) == 1:
-                            key = parts[0]
-                            val = client.aliases.get(key)
-                            if val is not None:
-                                print(f"   {key}: {val}")
-                                continue
-                            # substring search across names and values (case-insensitive)
-                            q = key.lower()
-                            matches = []
-                            for n, b in client.aliases.items():
-                                if q in n.lower() or q in b.lower():
-                                    matches.append((n, b))
-                            if matches:
-                                for n, b in sorted(matches, key=lambda kv: kv[0].lower()):
-                                    print(f"   {n}: {b}")
-                                print(f"\nexact alias not found. however, {len(matches)} instance(s) of the search string were found")
-                            else:
-                                print("\nno alias or instances of the search string found")
-                            continue
-
-                        # 3) name + value... → set/replace with conflict handling
-                        name, body = parts[0], " ".join(parts[1:])
-                        if not name:
-                            print("Alias name is too long or empty")
-                            continue
-
-                        # Conflict policy:
-                        #  - commands ALWAYS take precedence → rename to *_a
-                        #  - cvars: rename to *_a unless cl_aliasoverlap==1
-                        want_overlap = bool(cvar_system.get_bool("cl_aliasoverlap", False))
-                        cmd_conflict = (name.lower() in _RESERVED_CMDS)
-                        cvar_conflict = (not want_overlap) and (cvar_system.find(name) is not None)
-                        final_name = name
-                        if cmd_conflict or cvar_conflict:
-                            final_name = f"{name}_a"
-                            print(f"alias {name} renamed to {final_name} due to {'command' if cmd_conflict else 'cvar'} conflict")
-
-                        # Reuse existing alias object if present (by final_name)
-                        existed = final_name in client.aliases
-                        client.aliases[final_name] = (body + ("\n" if not body.endswith("\n") else ""))
-                        if existed:
-                            print(f"updated alias {final_name}")
-                        else:
-                            print(f"alias {name!r} set ({final_name!r})")
-                        continue
-
-                    # Try alias expansion first: use loaded (server/local) aliases.
-                    if client and not client.disconnected and client._alive:
-                        expanded = client._expand_alias(raw)
-                    else:
-                        expanded = None
-                        # If user tries to issue server commands while disconnected, nudge them.
-                        if _is_raw_server_command(raw):
-                            print("🔌 Not connected. Use: connect host[:port]")
-                            continue
-                    if expanded:
-                        for cmd_out in expanded:
-                            await client.send_command(cmd_out)
-                        continue
-
-                    # If it looks like a raw server command, send it verbatim
-                    if _is_raw_server_command(raw):
-                        # Special-case say: keep the nicer "You:" echo
-                        if re.match(r"^say\s+(.+)$", raw, flags=re.IGNORECASE):
-                            await client.send_command(raw)
-                            try:
-                                said = re.sub(r"^say\s+", "", raw, flags=re.IGNORECASE)
-                            except Exception:
-                                said = raw
-                            #CON.write(f"💬 You: {said}")
-                        elif re.match(r"^say_team\s+(.+)$", raw, flags=re.IGNORECASE):
-                            await client.send_command(raw)
-                            try:
-                                said = re.sub(r"^say_team\s+", "", raw, flags=re.IGNORECASE)
-                            except Exception:
-                                said = raw
-                            #CON.write(f"👪 TEAM • You: {said}")
-                        else:
-                            await client.send_command(raw)
-                    else:
-                        # Only send to server when actually connected.
-                        if CURRENT_CLIENT and CURRENT_CLIENT._alive and not CURRENT_CLIENT.disconnected:
-                            # If the line looks like a real server command, forward it verbatim;
-                            # otherwise treat it as chat.
-                            if _is_raw_server_command(line):
-                                await client.send_command(line)
-                            else:
-                                await client.send_command(f"say {line}")
-                        else:
-                            # Disconnected: never try to send; just echo locally so the console
-                            # doesn't break on unknown input while offline.
-                            if line.strip():
-                                CON.write(f"(offline) {line}")
-                            # (nothing else to do in offline mode)
-
-            except (KeyboardInterrupt, EOFError):
-                print("\nDisconnecting...")
+                line = await asyncio.get_running_loop().run_in_executor(None, session.read_line, "> ")
+            except (EOFError, KeyboardInterrupt):
                 break
-            except Exception as e:
-                print(f"Error: {e}")
-                continue
-
+            finally:
+                _INPUT_ACTIVE.clear()
+                _mark_activity()
+            await session.dispatcher.execute(line, source="console")
     finally:
-        if 'hb_task' in locals() and hb_task:
-            hb_task.cancel()
-            try:
-                await hb_task
-            except:
-                pass
-        if 'kick_task' in locals() and kick_task:
-            kick_task.cancel()
-            try:
-                await kick_task
-            except:
-                pass
-        if 'guard_task' in locals() and guard_task:
-            guard_task.cancel()
-            try:
-                await guard_task
-            except:
-                pass
-        if 'chatinfo_task' in locals() and chatinfo_task:
-            chatinfo_task.cancel()
-            try: await chatinfo_task
-            except: pass
         _INPUT_ACTIVE.clear()
-        _set_current_client(None)
-        # Always auto-save config on clean shutdown (if CVAR system present)
-        try:
-            _autosave_config(silent=True)  # Silent save on quit
-        except Exception:
-            pass
-        try:
-            await client.disconnect()
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            pass
-        if demo is not None:
-            demo.stop_recording()
-            with open('pyquake.dem', 'wb') as f:
-                demo.dump(f)
-            print("Demo saved to pyquake.dem")
-        # else: demo recording disabled - silent cleanup
+        await session.close()
+        _CONSOLE_SESSION = None
 
 
 def aioclient_main(args=None):

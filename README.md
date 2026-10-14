@@ -17,7 +17,28 @@ python3 -m pyquake.client --demo localhost 26000
 python3 -m pyquake.client test localhost 26000
 ```
 
-Use `help` in the console to list commands and `quit` to exit. Settings are saved to `config.cfg` in the current working directory.
+Use `help` in the console to list commands and `quit` to exit. Settings and aliases are saved to `config.cfg` in the current working directory.
+
+Input defaults to commands (`cl_chatmode 0`), so `ready` reaches the server as a command. Use `say hello` or `s hello` to chat. The archived `cl_chatmode` setting controls typed input:
+
+| Value | Behavior |
+| --- | --- |
+| `0` | Command input; chat uses `say` or `s`. |
+| `1` | Unknown input becomes chat; known commands, cvars, and aliases still execute. Use `/command` to force a server command. |
+| `2` | Automatic chat, with a leading space prefilled when readline is available. Remove the space to enter a known command. |
+| `3` | A leading space sends chat; unspaced input executes commands. |
+
+Scripts, aliases, and queued commands always execute as commands. They share the console's dispatcher, including local commands, cvars, nested `exec`, semicolon batches, and `wait [frames]`. Quotes preserve semicolons; `//` starts a comment outside quotes after whitespace.
+
+```text
+alias warmup "ready; wait; status"
+warmup
+seta cl_chatmode 1
+writeconfig
+exec "practice.cfg"
+```
+
+Aliases work offline and survive reconnects. `cfg_save_aliases 1` (the default) includes them in saved configs; set it to `0` to save only archived settings. Use `seta name value` to create a saved custom variable. Nested config paths are checked from the working directory, then relative to the calling config.
 
 Run the regression checks with:
 

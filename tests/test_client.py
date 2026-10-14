@@ -139,15 +139,39 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         self.client.aliases.update(a="b", b="a")
         client.CURRENT_CLIENT = self.client
         with mock.patch.object(client, "Cbuf_InsertText") as queue:
-            self.assertTrue(client._handle_local_command("a"))
+            await client._get_console_session().dispatcher.execute("a")
             queue.assert_not_called()
         self.assertIn("Alias expansion exceeded", client.CON.write.call_args.args[0])
 
     async def test_quoted_semicolon_is_not_requeued_forever(self):
         with mock.patch.object(client, "Cbuf_AddText") as queue:
-            self.assertTrue(client._handle_local_command('echo "hello; world"'))
+            await client._get_console_session().dispatcher.execute('echo "hello; world"')
             queue.assert_not_called()
         client.CON.write.assert_called_with("hello; world")
+
+    async def test_server_aliases_share_persistent_table_and_keep_commands_reserved(self):
+        waiting = asyncio.create_task(self.client.wait_for_center_print())
+        await asyncio.sleep(0)
+        self.conn.incoming.put_nowait(b'\x09alias "quit" "ready"\nalias watch "cmd observe"\nquit\n\0\x1aloaded\0')
+        await asyncio.wait_for(waiting, 1)
+        self.assertEqual(self.cvars.command_aliases["quit_a"], "ready")
+        self.assertEqual(self.cvars.command_aliases["watch"], "cmd observe")
+        self.assertFalse(self.client._read_task.done())
+
+    async def test_programmatic_client_captures_aliases_without_console_initialization(self):
+        del client.cvar_system
+        standalone = client.AsyncClient(FakeConnection())
+        standalone._read_task = asyncio.create_task(standalone._read_messages())
+        standalone._read_task.add_done_callback(standalone._reader_finished)
+        try:
+            waiting = asyncio.create_task(standalone.wait_for_center_print())
+            await asyncio.sleep(0)
+            standalone._conn.incoming.put_nowait(b'\x09alias watch "cmd observe"\n\0\x1aloaded\0')
+            await asyncio.wait_for(waiting, 1)
+            self.assertEqual(standalone.aliases["watch"], "cmd observe")
+        finally:
+            client.cvar_system = self.cvars
+            await standalone.disconnect()
 
     async def test_console_reconnect_uses_new_client_and_cleans_up_tasks(self):
         connections = []
