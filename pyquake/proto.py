@@ -331,8 +331,8 @@ class ServerMessage:
             (coord,), m = cls._parse_struct("<i", m)
             coord = coord / 16
         elif proto_flags & int(ProtocolFlags._24BITCOORD):
-            high, low = cls._parsestruct("<hB", m)
-            coord = x1 + x2 / 255
+            (high, low), m = cls._parse_struct("<hB", m)
+            coord = high + low / 255
         else:
             (coord,), m = cls._parse_struct("<h", m)
             coord = coord / 8
@@ -385,7 +385,7 @@ class ServerMessage:
         upper_byte, m = cls._parse_optional(bit, flags, "<B", m)
         if upper_byte is not None:
             if lower_byte is None:
-                raise MalformedNetworkData(f'Lower byte present but upper byte not present')
+                raise MalformedNetworkData('Upper byte present but lower byte not present')
             assert (lower_byte & 0xff) == lower_byte
             out = (upper_byte << 8) | lower_byte
         else:
@@ -394,6 +394,13 @@ class ServerMessage:
 
     @classmethod
     def parse_message(cls, m, protocol):
+        try:
+            return cls._parse_message(m, protocol)
+        except (IndexError, struct.error) as exc:
+            raise MalformedNetworkData("Truncated server message") from exc
+
+    @classmethod
+    def _parse_message(cls, m, protocol):
         msg_type_int = m[0]
 
         if msg_type_int & int(_UpdateFlags.SIGNAL):
@@ -461,7 +468,7 @@ class ServerMessageUpdate(ServerMessage):
         if flags & 1: # MOREBITS
             flags |= (m[n] << 8)
             n += 1
-            if flags & (1 << 15):  # EXTEND1
+            if protocol.version != ProtocolVersion.NETQUAKE and flags & (1 << 15):  # EXTEND1
                 flags |= m[n] << 16
                 n += 1
                 if flags & (1 << 23): # EXTEND2
@@ -545,19 +552,24 @@ class ServerMessageUpdate(ServerMessage):
     @classmethod
     def parse(cls, m, protocol):
         int_flags, m_after_flags = cls._parse_flags_fast(m, protocol)
+        protocol_key = (protocol.version, protocol.flags)
+        size_key = (*protocol_key, int_flags)
 
         msg = None
-        size = cls._size_cache.get(int_flags)
+        size = cls._size_cache.get(size_key)
         if size is not None:
-            msg = cls._msg_cache.get(m[:size])
+            msg = cls._msg_cache.get((*protocol_key, m[:size]))
 
         if msg is None:
             flags, _ = cls._parse_flags_safe(m, protocol)
             assert flags == int_flags, f"flags={flags} int_flags={int_flags}"
             msg, m_after, flags = cls._parse_no_cache(flags, m_after_flags, protocol)
             size = len(m) - len(m_after)
-            cls._size_cache[flags] = size
-            cls._msg_cache[m[:size]] = msg
+            # Live sessions continually receive new entity positions.
+            if len(cls._msg_cache) >= 4096:
+                cls.clear_cache()
+            cls._size_cache[size_key] = size
+            cls._msg_cache[(*protocol_key, m[:size])] = msg
 
         return msg, m[size:]
 
@@ -582,14 +594,14 @@ class ServerMessageFoundSecret(NoFieldsServerMessage):
 
 @_register_server_message
 class ServerMessageBonusFlash(NoFieldsServerMessage):
-    protocols = {ProtocolVersion.FITZQUAKE}
+    protocols = {ProtocolVersion.FITZQUAKE, ProtocolVersion.RMQ}
     msg_type = ServerMessageType.BF
 
 
 @_register_server_message
 class ServerMessageFog(ServerMessage):
     field_names = ('density', 'color', 'time')
-    protocols = {ProtocolVersion.FITZQUAKE}
+    protocols = {ProtocolVersion.FITZQUAKE, ProtocolVersion.RMQ}
     msg_type = ServerMessageType.FOG
 
     @classmethod
@@ -644,8 +656,8 @@ class ServerMessageStuffText(ServerMessage):
 
 @_register_server_message
 class ServerMessageSkybox(ServerMessage):
-    protocols = {ProtocolVersion.FITZQUAKE}
-    name = ('string',)
+    protocols = {ProtocolVersion.FITZQUAKE, ProtocolVersion.RMQ}
+    field_names = ('string',)
     msg_type = ServerMessageType.SKYBOX
 
     @classmethod
@@ -722,7 +734,7 @@ class _SpawnBaselineBase(ServerMessage):
         if version == 2:
             (bits,), m = cls._parse_struct("<B", m)
             bits = _BaselineBits(bits)
-            fmt = (f"{'H' if bits & _BaselineBits.LARGEMODEL else 'B'}"
+            fmt = (f"<{'H' if bits & _BaselineBits.LARGEMODEL else 'B'}"
                    f"{'H' if bits & _BaselineBits.LARGEFRAME else 'B'}"
                    "BB")
         else:
@@ -810,7 +822,7 @@ class ServerMessageUpdateName(ServerMessage):
 
 @_register_server_message
 class ServerMessageUpdateFrags(StructServerMessage):
-    fmt = "<BH"
+    fmt = "<Bh"
     field_names = ("client_num", "count")
     msg_type = ServerMessageType.UPDATEFRAGS
 
@@ -836,7 +848,7 @@ class ServerMessageLightStyle(ServerMessage):
 
 @_register_server_message
 class ServerMessageUpdateStat(StructServerMessage):
-    fmt = "<BI"
+    fmt = "<Bi"
     field_names = ('index', 'value')
     msg_type = ServerMessageType.UPDATESTAT
 
@@ -870,7 +882,10 @@ class ServerMessageServerInfo(ServerMessage):
     @classmethod
     def parse(cls, m, protocol):
         (protocol_version,), m = cls._parse_struct("<I", m)
-        protocol_version = ProtocolVersion(protocol_version)
+        try:
+            protocol_version = ProtocolVersion(protocol_version)
+        except ValueError as exc:
+            raise UnsupportedProtocol(f"Unsupported protocol: {protocol_version}") from exc
 
         if protocol_version == ProtocolVersion.RMQ:
             (protocol_flags,), m = cls._parse_struct("<I", m)
@@ -928,18 +943,18 @@ class ServerMessageClientData(ServerMessage):
             if fq_flags:
                 raise MalformedNetworkData(f'{fq_flags} passed but protocol is {protocol}')
 
-        view_height, m = cls._parse_optional(_ClientDataFlags.VIEWHEIGHT, flags, "<B", m,
+        view_height, m = cls._parse_optional(_ClientDataFlags.VIEWHEIGHT, flags, "<b", m,
                                              default=_DEFAULT_VIEW_HEIGHT)
-        ideal_pitch, m = cls._parse_optional(_ClientDataFlags.IDEALPITCH, flags, "<B", m, default=0)
+        ideal_pitch, m = cls._parse_optional(_ClientDataFlags.IDEALPITCH, flags, "<b", m, default=0)
 
         fix_velocity = lambda v: v * 16
-        punch1, m = cls._parse_optional(_ClientDataFlags.PUNCH1, flags, "<B", m, default=0)
+        punch1, m = cls._parse_optional(_ClientDataFlags.PUNCH1, flags, "<b", m, default=0)
         m_velocity1, m = cls._parse_optional(_ClientDataFlags.VELOCITY1, flags, "<b", m, fix_velocity,
                                              default=0)
-        punch2, m = cls._parse_optional(_ClientDataFlags.PUNCH2, flags, "<B", m, default=0)
+        punch2, m = cls._parse_optional(_ClientDataFlags.PUNCH2, flags, "<b", m, default=0)
         m_velocity2, m = cls._parse_optional(_ClientDataFlags.VELOCITY2, flags, "<b", m, fix_velocity,
                                              default=0)
-        punch3, m = cls._parse_optional(_ClientDataFlags.PUNCH3, flags, "<B", m, default=0)
+        punch3, m = cls._parse_optional(_ClientDataFlags.PUNCH3, flags, "<b", m, default=0)
         m_velocity3, m = cls._parse_optional(_ClientDataFlags.VELOCITY3, flags, "<b", m, fix_velocity,
                                              default=0)
         punch_angles = (punch1, punch2, punch3)
@@ -955,7 +970,7 @@ class ServerMessageClientData(ServerMessage):
         armor, m = cls._parse_optional(_ClientDataFlags.ARMOR, flags, "<B", m, default=0)
         weapon_model_index, m = cls._parse_optional(_ClientDataFlags.WEAPON, flags, "<B", m, default=0)
 
-        (health, ammo, shells, nails, rockets, cells, active_weapon), m = cls._parse_struct("<HBBBBBB", m)
+        (health, ammo, shells, nails, rockets, cells, active_weapon), m = cls._parse_struct("<hBBBBBB", m)
         active_weapon = ItemFlags(active_weapon)
 
         if protocol.version != ProtocolVersion.NETQUAKE:
@@ -1012,13 +1027,13 @@ class ServerMessageSound(ServerMessage):
                 raise MalformedNetworkData(f'{fq_flags} passed but protocol is {protocol}')
 
         if flags & _SoundFlags.LARGEENTITY:
-            (ent, channel), m = cls._parse_struct("<HB", m)
+            (entity_num, channel), m = cls._parse_struct("<HB", m)
         else:
             (t,), m = cls._parse_struct("<H", m)
             entity_num = t >> 3
             channel = t & 7
 
-        sound_num, m = cls._parse_struct("<H" if flags & _SoundFlags.LARGESOUND else "<B", m)
+        (sound_num,), m = cls._parse_struct("<H" if flags & _SoundFlags.LARGESOUND else "<B", m)
         pos, m = cls._parse_coords(m, protocol)
 
         return cls(volume, attenuation, entity_num, channel, sound_num, pos), m
@@ -1052,7 +1067,11 @@ class ServerMessageTempEntity(ServerMessage):
 
     @classmethod
     def parse(cls, m, protocol):
-        temp_entity_type, m = TempEntityTypes(m[0]), m[1:]
+        try:
+            temp_entity_type = TempEntityTypes(m[0])
+        except ValueError as exc:
+            raise MalformedNetworkData(f"Invalid temp entity type: {m[0]}") from exc
+        m = m[1:]
 
         if temp_entity_type in (TempEntityTypes.LIGHTNING1, TempEntityTypes.LIGHTNING2, TempEntityTypes.LIGHTNING3,
                                 TempEntityTypes.BEAM):
@@ -1158,4 +1177,3 @@ def demo_parser_main():
         cProfile.runctx('f()', globals(), locals(), 'stats')
     else:
         f()
-

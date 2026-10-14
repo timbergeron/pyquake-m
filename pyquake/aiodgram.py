@@ -24,13 +24,15 @@ import enum
 import logging
 import socket
 import struct
-import sys
 
 
 logger = logging.getLogger(__name__)
 
 
 _MAX_DATAGRAM_BODY = 32000
+_CONNECT_TIMEOUT = 10.0
+_ACK_TIMEOUT = 1.0
+_RELIABLE_ATTEMPTS = 10
 
 
 class _NetFlags(enum.IntFlag):
@@ -70,6 +72,7 @@ class _GenericUdpProtocol(asyncio.DatagramProtocol):
         self._connected_future = asyncio.Future()
         self._transport = None
         self._recv_queue = asyncio.Queue()
+        self._connection_lost_callback = None
 
     def connection_made(self, transport):
         self._transport = transport
@@ -96,10 +99,8 @@ class _GenericUdpProtocol(asyncio.DatagramProtocol):
         self._transport.sendto(data, addr)
 
     def connection_lost(self, exc):
-        # Normal with asyncio when transport/loop closes; treat as disconnect.
-        # Note: This is in _GenericUdpProtocol, but we need to notify the DatagramConnection
-        # We can't directly access it here, so we'll let the disconnect() method handle this
-        pass
+        if self._connection_lost_callback is not None:
+            self._connection_lost_callback(exc)
 
     # --- Windows Proactor: handle UDP socket errors gracefully ---
     def error_received(self, exc):
@@ -120,10 +121,6 @@ class _GenericUdpProtocol(asyncio.DatagramProtocol):
             pass
 
 
-def _raise_cb(fut):
-    fut.result()
-
-
 class DatagramConnection:
     def __init__(self, udp_protocol):
         self._host = None
@@ -136,31 +133,36 @@ class DatagramConnection:
         self._message_queue = asyncio.Queue()
 
         self._unreliable_send_seq = 0
-        # Track last received unreliable sequence to de-dup and avoid AttributeError
-        self._unreliable_recv_seq = -1
-        self._tasks = None            # a Task or a gather() of tasks
+        self._tasks = ()
         self._closing = False
         self._closed_exc = None
-        # ensure the queue exists for the reliable sender
-        self._send_reliable_queue = getattr(self, "_send_reliable_queue", asyncio.Queue())
+        self._pending_sends = set()
+        self._udp._connection_lost_callback = self.connection_lost
 
         self.joequake_version = None
 
     def connection_lost(self, exc):
-        # Handle connection loss gracefully - treat as disconnect
+        if self._closing:
+            return
         self._closing = True
-        self._closed_exc = exc
-        # Wake any sender loop blocked on queue.get()
-        try:
-            self._send_reliable_queue.put_nowait((None, None))  # sentinel
-        except Exception:
-            pass
-        # Allow any supervisor task to wind down
-        try:
-            if self._tasks:
-                self._tasks.cancel()
-        except Exception:
-            pass
+        self._closed_exc = DatagramError(str(exc) if exc else "Connection closed")
+        for future in self._pending_sends:
+            if not future.done():
+                future.set_exception(self._closed_exc)
+        self._message_queue.put_nowait(None)
+        for task in self._tasks:
+            task.cancel()
+        if self._udp._transport is not None:
+            self._udp._transport.close()
+
+    def _task_done(self, task):
+        exc = None if task.cancelled() else task.exception()
+        if not self._closing:
+            self.connection_lost(exc)
+
+    def _check_open(self):
+        if self._closing:
+            raise self._closed_exc
 
     async def _monitor_queues(self):
         while True:
@@ -178,7 +180,10 @@ class DatagramConnection:
                     bytes([joequake_version, 0, 0, 0, 0, 0]))
 
     async def _connect(self, host, port, desired_joequake_version=None):
-        host = socket.gethostbyname(host)
+        loop = asyncio.get_running_loop()
+        addresses = await loop.getaddrinfo(host, port, family=socket.AF_INET,
+                                          type=socket.SOCK_DGRAM)
+        host = addresses[0][4][0]
 
         await self._udp.wait_until_connected()
 
@@ -193,13 +198,18 @@ class DatagramConnection:
             self._udp.sendto(header + body, (host, port))
             try:
                 packet, addr = await asyncio.wait_for(self._udp.recvfrom(), 1.0)
+                if addr != (host, port):
+                    continue
+                if len(packet) < header_size + 1:
+                    continue
+                flags, size = struct.unpack(header_fmt, packet[:header_size])
+                if flags != _NetFlags.CTL or size != len(packet):
+                    continue
                 response_received = True
             except asyncio.TimeoutError:
                 pass
 
         # Parse the response.
-        if addr != (host, port):
-            raise DatagramError("Spoofed packet received")
         netflags, size = struct.unpack(header_fmt, packet[:header_size])
         netflags = _NetFlags(netflags)
         body = packet[header_size:]
@@ -209,9 +219,16 @@ class DatagramConnection:
             raise DatagramError(f"Unexpected net flags: {netflags}")
 
         # All going well, the body should contain a new port to communicate with.
+        if body[0] == 0x82:
+            reason = body[1:].split(b'\0', 1)[0].decode("latin-1")
+            raise DatagramError(reason or "Connection rejected")
         if body[0] != 0x81:
             raise DatagramError(f"Expected CCREP_ACCEPT message, not {body[0]}")
+        if len(body) < 5:
+            raise DatagramError("Truncated CCREP_ACCEPT message")
         self._port, = struct.unpack("<L", body[1:5])
+        if not 1 <= self._port <= 65535:
+            raise DatagramError(f"Invalid server port: {self._port}")
         self._host = host
 
         if len(body) > 5:
@@ -229,10 +246,12 @@ class DatagramConnection:
         logger.info("Connection Accepted")
 
         # Spin up required tasks.
-        self._tasks = asyncio.gather(
+        self._tasks = (
             asyncio.create_task(self._send_reliable_loop()),
             asyncio.create_task(self._recv_loop()),
             asyncio.create_task(self._monitor_queues()))
+        for task in self._tasks:
+            task.add_done_callback(self._task_done)
 
     @classmethod
     async def connect(cls, host, port, joequake_version=None):
@@ -245,20 +264,20 @@ class DatagramConnection:
         )
 
         conn = cls(protocol)
-        await conn._connect(host, port, joequake_version)
+        try:
+            await asyncio.wait_for(conn._connect(host, port, joequake_version),
+                                   _CONNECT_TIMEOUT)
+        except asyncio.TimeoutError as exc:
+            conn.connection_lost(exc)
+            raise DatagramError(f"Connection to {host}:{port} timed out") from exc
+        except BaseException:
+            conn.connection_lost(None)
+            raise
         return conn
 
     async def wait_until_disconnected(self):
-        # Never leak CancelledError during normal shutdown.
-        t = self._tasks
-        if not t:
-            return
-        try:
-            await asyncio.gather(t, return_exceptions=True)
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            pass
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
 
     def _encap_packet(self, netflags, seq_num, payload):
         logger.debug("Sending packet: %s, %s, %s", netflags, seq_num, payload)
@@ -274,10 +293,9 @@ class DatagramConnection:
         while True:
             # Wait for the next message to be sent.
             data_fut = await self._send_reliable_queue.get()
-            # Sentinel from disconnect(): exit cleanly
-            if not data_fut or data_fut[0] is None:
-                break
             data, fut = data_fut
+            if fut.cancelled():
+                continue
 
             # Split the message into packets up to the maximum allowed.
             while data:
@@ -287,36 +305,56 @@ class DatagramConnection:
                 if not data:
                     netflags |= _NetFlags.EOM
                 packet = self._encap_packet(netflags, send_seq, payload)
-                self._udp.sendto(packet, (self._host, self._port))
-
-                # Wait for an ACK
-                while True:
-                    ack_seq = await self._send_reliable_ack_queue.get()
-                    if ack_seq != send_seq:
-                        logger.warning("Stale ACK received")
-                    else:
+                for _ in range(_RELIABLE_ATTEMPTS):
+                    self._udp.sendto(packet, (self._host, self._port))
+                    deadline = asyncio.get_running_loop().time() + _ACK_TIMEOUT
+                    acked = False
+                    while True:
+                        remaining = deadline - asyncio.get_running_loop().time()
+                        if remaining <= 0:
+                            break
+                        try:
+                            ack_seq = await asyncio.wait_for(
+                                self._send_reliable_ack_queue.get(), remaining)
+                        except asyncio.TimeoutError:
+                            break
+                        if ack_seq == send_seq:
+                            acked = True
+                            break
+                        logger.debug("Stale ACK received: %s", ack_seq)
+                    if acked:
                         break
+                else:
+                    raise DatagramError("Reliable packet acknowledgement timed out")
 
-                send_seq += 1
+                send_seq = (send_seq + 1) & 0xffffffff
 
             # Let the caller know the result
-            fut.set_result(None)
+            if not fut.done():
+                fut.set_result(None)
 
     async def send_reliable(self, data):
-        acked_future = asyncio.Future()
-        await self._send_reliable_queue.put((data, acked_future))
-        await acked_future
+        self._check_open()
+        acked_future = asyncio.get_running_loop().create_future()
+        self._pending_sends.add(acked_future)
+        try:
+            self._send_reliable_queue.put_nowait((data, acked_future))
+            await acked_future
+        finally:
+            self._pending_sends.discard(acked_future)
 
     def send(self, data):
+        self._check_open()
         if len(data) > _MAX_DATAGRAM_BODY:
             raise DatagramError(f"Datagram too big: {len(data)}")
         packet = self._encap_packet(_NetFlags.UNRELIABLE,
                                     self._unreliable_send_seq,
                                     data)
         self._udp.sendto(packet, (self._host, self._port))
-        self._unreliable_send_seq += 1
+        self._unreliable_send_seq = (self._unreliable_send_seq + 1) & 0xffffffff
 
     def send_oob(self, payload: bytes):
+        self._check_open()
         # raw UDP, no netchan framing; mirrors sfunc.Write(...)
         self._udp.sendto(payload, (self._host, self._port))
 
@@ -335,35 +373,45 @@ class DatagramConnection:
         while True:
             packet, addr = await self._udp.recvfrom()
             if addr != (self._host, self._port):
-                raise DatagramError("Spoofed packet received")
+                logger.debug("Ignoring packet from unexpected address: %s", addr)
+                continue
+
+            if len(packet) < 4:
+                logger.warning("Ignoring truncated datagram")
+                continue
+            netflags, size = struct.unpack(">HH", packet[:4])
+            if len(packet) != size:
+                logger.warning("Ignoring datagram with invalid size: %s", size)
+                continue
+            if netflags == _NetFlags.CTL:
+                body = packet[4:]
+                if body[:1] == b'\x86':  # CCREP_RCON uses a four-byte header.
+                    txt = body[1:].decode("latin-1").rstrip("\x00\r\n")
+                    if txt:
+                        print(f"[rcon] {txt}")
+                continue
+            if len(packet) < header_size:
+                logger.warning("Ignoring truncated netchan header")
+                continue
 
             netflags, size, seq_num = struct.unpack(header_fmt, packet[:header_size])
             netflags = _NetFlags(netflags)
             body = packet[header_size:]
             logger.debug("Received packet: %s %s %s", netflags, seq_num, body)
 
-            if len(packet) != size:
-                raise DatagramError(f"Packet size {len(packet)} does not "
-                                    f"match header {size}")
-
             if netflags not in _SUPPORTED_FLAG_COMBINATIONS:
-                raise DatagramError(f"Unsupported flag combination: {netflags}")
-
-            # Handle RCON replies (NetQuake control datagrams)
-            if netflags == _NetFlags.CTL:
-                txt = body.decode("latin-1", "ignore").rstrip("\x00\r\n")
-                if txt:
-                    print(f"?? [rcon] {txt}")
-                continue  # Don't feed into netchan
+                logger.warning("Ignoring unsupported flag combination: %s", netflags)
+                continue
 
             if _NetFlags.UNRELIABLE in netflags:
-                if seq_num < unreliable_recv_seq:
+                skipped = (seq_num - unreliable_recv_seq) & 0xffffffff
+                if skipped >= 0x80000000:
                     logger.warning("Stale unreliable message received")
                 else:
-                    if seq_num != unreliable_recv_seq:
+                    if skipped:
                         logger.warning("Skipped %s unreliable messages",
-                                       self._unreliable_recv_seq - seq_num)
-                    unreliable_recv_seq = seq_num + 1
+                                       skipped)
+                    unreliable_recv_seq = (seq_num + 1) & 0xffffffff
                     await self._message_queue.put(body)
             elif _NetFlags.ACK in netflags:
                 await self._send_reliable_ack_queue.put(seq_num)
@@ -371,43 +419,32 @@ class DatagramConnection:
                 self._send_ack(seq_num)
                 if seq_num != recv_seq:
                     logger.warning("Duplicate reliable message received")
+                    continue
                 else:
                     reliable_msg += body
-                    recv_seq += 1
+                    recv_seq = (recv_seq + 1) & 0xffffffff
 
                 if _NetFlags.EOM in netflags:
                     await self._message_queue.put(reliable_msg)
                     reliable_msg = b''
 
     async def read_message(self):
-        return await self._message_queue.get()
+        self._check_open()
+        message = await self._message_queue.get()
+        if message is None:
+            self._message_queue.put_nowait(None)
+            raise self._closed_exc
+        return message
 
     def disconnect(self):
-        # Tell loops to wind down and wake anything blocked on queue.get()
-        self._closing = True
-        try:
-            # Wake the sender loop (sentinel)
-            self._send_reliable_queue.put_nowait((None, None))
-        except Exception:
-            pass
+        if self._closing:
+            return
         try:
             # Send disconnect message
             self.send(b'\x02')
         except Exception:
             pass
-        try:
-            # Close the underlying transport/socket; recv loop should see EOF/close
-            if hasattr(self._udp, '_transport') and self._udp._transport:
-                self._udp._transport.close()
-        except Exception:
-            pass
-        # Optionally cancel a wrapper task that just awaits the loops;
-        # we'll swallow any cancellation in wait_until_disconnected().
-        try:
-            if self._tasks:
-                self._tasks.cancel()
-        except Exception:
-            pass
+        self.connection_lost(None)
 
 
 async def _async_main():
@@ -420,4 +457,3 @@ async def _async_main():
 def main():
     logging.basicConfig(level=logging.DEBUG)
     asyncio.run(_async_main())
-

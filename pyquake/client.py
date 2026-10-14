@@ -18,6 +18,7 @@
 #     OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
 #     USE OR OTHER DEALINGS IN THE SOFTWARE.
 
+import argparse
 import asyncio
 import dataclasses
 import logging
@@ -52,11 +53,13 @@ import locale
 import shutil
 from typing import Optional, Callable, Any, Tuple
 from enum import Flag, Enum, auto
-import numpy as np
 from threading import Event
 
-import aiodgram
-import proto
+if __package__:
+    from . import aiodgram, proto
+else:
+    import aiodgram
+    import proto
 from typing import Union
 
 # --- Windows UDP reliability: use SelectorEventLoop instead of Proactor ---
@@ -203,8 +206,12 @@ class Cvar:
                 self.value = float(s)
             except Exception:
                 self.value = 0.0
+        if not math.isfinite(self.value):
+            self.value = 0.0
 
     def _format_float(self, value: float) -> str:
+        if not math.isfinite(value):
+            return "0"
         if value == int(value):
             return str(int(value))
         s = f"{value:.6f}".rstrip('0').rstrip('.')
@@ -225,6 +232,8 @@ class Cvar:
                 v = float(new_str)
             except Exception:
                 v = 0.0
+        if not math.isfinite(v):
+            v = 0.0
         if self.minimum is not None and v < self.minimum:
             v = self.minimum
         if self.maximum is not None and v > self.maximum:
@@ -281,6 +290,10 @@ class CvarSystem:
 
     def subscribe(self, fn: Callable[[Cvar, str, str], None]) -> None:
         self._listeners.append(fn)
+
+    def unsubscribe(self, fn: Callable[[Cvar, str, str], None]) -> None:
+        if fn in self._listeners:
+            self._listeners.remove(fn)
 
     def register(self, cvar: Cvar) -> bool:
         with self._lock:
@@ -354,8 +367,8 @@ class CvarSystem:
             if ok:
                 if cvar.flags & CvarFlags.USERINFO: self._userinfo_dirty = True
                 if cvar.flags & CvarFlags.SERVERINFO: self._serverinfo_dirty = True
-                if cvar.flags & CvarFlags.NOTIFY:
-                    for fn in self._listeners:
+                if old != cvar.string and cvar.flags & (CvarFlags.NOTIFY | CvarFlags.USERINFO):
+                    for fn in tuple(self._listeners):
                         try: fn(cvar, old, cvar.string)
                         except Exception: pass
             return ok
@@ -371,7 +384,7 @@ class CvarSystem:
         return self.set(name, self._format_float(value))
 
     def set_value_quick(self, cvar: Cvar, value: float) -> bool:
-        return cvar.set_value_quick(value)
+        return self.set_quick(cvar, self._format_float(value))
 
     def set_rom(self, name: str, value: str) -> bool:
         with self._lock:
@@ -432,12 +445,12 @@ class CvarSystem:
             if not cvar:
                 print(f"variable '{name}' not found")
                 return False
-            return cvar.reset()
+            return self.set(cvar.name, cvar.default_string)
 
     def reset_all(self):
         with self._lock:
             for cvar in self._cvars.values():
-                cvar.reset()
+                self.reset(cvar.name)
 
     def complete_variable(self, partial: str, limit: int = 16) -> list[str]:
         if not partial:
@@ -566,6 +579,8 @@ class CvarSystem:
             return False
 
     def _format_float(self, value: float) -> str:
+        if not math.isfinite(value):
+            return "0"
         if value == int(value):
             return str(int(value))
         return f"{value:.6f}".rstrip('0').rstrip('.')
@@ -1368,13 +1383,26 @@ def _parse_hostport_spec(spec: str, default_port: int | None = None):
     return (host, port) if 1 <= port <= 65535 else None
 
 def _split_queued_commands(s: str) -> list[str]:
-    """
-    Split alias bodies into individual commands by newlines/semicolons.
-    This is intentionally simple (not quote-aware), good enough for Quake aliases.
-    """
+    """Split Quake command lines while preserving quoted semicolons."""
     parts: list[str] = []
-    for line in s.splitlines():
-        parts.extend([p.strip() for p in line.split(';') if p.strip()])
+    start = 0
+    quoted = escaped = False
+    for i, char in enumerate(s):
+        if char in "\r\n" or (char == ";" and not quoted):
+            part = s[start:i].strip()
+            if part:
+                parts.append(part)
+            start = i + 1
+            quoted = escaped = False
+        elif escaped:
+            escaped = False
+        elif char == "\\" and quoted:
+            escaped = True
+        elif char == '"':
+            quoted = not quoted
+    part = s[start:].strip()
+    if part:
+        parts.append(part)
     return parts
 
 # Built-in client commands that shouldn't be shadowed; used for conflict rename.
@@ -2477,7 +2505,11 @@ def _invoke_alias_if_any(raw: str) -> bool:
                 break
     if key is None:
         return False
-    body = (aliases.get(key) or "").strip()
+    try:
+        body = "\n".join(CURRENT_CLIENT._expand_alias(key) or []).strip()
+    except ClientError as exc:
+        CON.write(str(exc))
+        return True
     if not body:
         return True  # alias exists but empty; still "handled"
     # Queue the alias body so ';' and 'wait' behave correctly
@@ -2505,7 +2537,7 @@ def _handle_local_command(line: str) -> bool:
             return True
 
     # --- semi-colon batching: run via command buffer so 'wait' works in one-liners ---
-    if (";" in raw) or ("\n" in raw):
+    if _split_queued_commands(raw) != [raw]:
         Cbuf_AddText(raw)
         return True
 
@@ -3227,12 +3259,15 @@ class Demo:
             self._angles.append(angles)
 
     def _parse_messages(self):
+        protocol = proto.Protocol(proto.ProtocolVersion.NETQUAKE, proto.ProtocolFlags(0))
         for msg in self._msgs:
             parsed_msgs = []
             remaining_msg = msg
             while remaining_msg:
                 parsed, remaining_msg = proto.ServerMessage.parse_message(
-                        remaining_msg)
+                        remaining_msg, protocol)
+                if parsed.msg_type == proto.ServerMessageType.SERVERINFO:
+                    protocol = parsed.protocol
                 parsed_msgs.append(parsed)
             yield parsed_msgs
 
@@ -3259,12 +3294,12 @@ class _BaseAngleCalculator:
     """Pass into `Demo.dump` to override view angles."""
 
     def _angle_difference(self, a, b):
-        t = (a - b) % (np.pi * 2.)
-        return min(t, 2. * np.pi - t)
+        t = (a - b) % math.tau
+        return min(t, math.tau - t)
 
     def _get_movement_yaws(self, parsed_msg_lists):
         view_entity = None
-        pos = np.zeros((3,))
+        pos = (0., 0., 0.)
         time = 0.
         move_time = None
         yaw = 0.
@@ -3274,23 +3309,23 @@ class _BaseAngleCalculator:
                 if parsed_msg.msg_type == proto.ServerMessageType.SETVIEW:
                     view_entity = parsed_msg.viewentity
 
-                if parsed_msg.msg_type == proto.ServerMessageType.SPAWNBASELINE:
-                    if view_entity is None:
-                        raise ClientError("View entity not set but spawnbaseline received")
+                if (parsed_msg.msg_type in (proto.ServerMessageType.SPAWNBASELINE,
+                                            proto.ServerMessageType.SPAWNBASELINE2)
+                        and parsed_msg.entity_num == view_entity):
                     pos = parsed_msg.origin
 
                 if parsed_msg.msg_type == proto.ServerMessageType.TIME:
                     time = parsed_msg.time
 
                 if (parsed_msg.msg_type == proto.ServerMessageType.UPDATE and parsed_msg.entity_num == view_entity):
-                    new_pos = np.array(_patch_vec(pos, parsed_msg.origin))
+                    new_pos = _patch_vec(pos, parsed_msg.origin)
                     if move_time is not None:
                         dt = time - move_time
                         # Guard zero/negative dt to avoid division errors and noise.
                         if dt and dt > 1e-6:
-                            vel = (new_pos - pos) / dt
-                            if np.linalg.norm(vel) > 50:
-                                yaw = np.arctan2(vel[1], vel[0])
+                            vel = tuple((new - old) / dt for new, old in zip(new_pos, pos))
+                            if math.hypot(*vel) > 50:
+                                yaw = math.atan2(vel[1], vel[0])
                     move_time = time
                     pos = new_pos
 
@@ -3300,7 +3335,7 @@ class _BaseAngleCalculator:
 class AngleCalculatorSmoothed(_BaseAngleCalculator):
     def _angle_cost(self, movement_yaw, yaw):
         diff = self._angle_difference(movement_yaw, yaw)
-        if diff < np.pi / 8:
+        if diff < math.pi / 8:
             return 0
         return 0.4
 
@@ -3308,11 +3343,12 @@ class AngleCalculatorSmoothed(_BaseAngleCalculator):
         paths = [([], 0.)]
         for j, movement_yaw in enumerate(self._get_movement_yaws(parsed_msg_lists)):
             new_paths = []
-            for yaw in np.linspace(0., 2. * np.pi, 8, endpoint=False):
+            for direction in range(8):
+                yaw = direction * math.tau / 8
                 c = self._angle_cost(movement_yaw, yaw)
                 new_dists = [int(bool(prev_path) and prev_path[-1] != yaw) + c + prev_dist
                              for prev_path, prev_dist in paths]
-                i = np.argmin(new_dists)
+                i = min(range(len(new_dists)), key=new_dists.__getitem__)
                 new_paths.append((paths[i][0] + [yaw], new_dists[i]))
             paths = new_paths
 
@@ -3328,7 +3364,7 @@ class AngleCalculatorHysteresis(_BaseAngleCalculator):
         yaw = 0.
         for movement_yaw in self._get_movement_yaws(parsed_msg_lists):
             if self._angle_difference(movement_yaw, yaw) > self._hysteresis_angle:
-                yaw = np.pi * round((4 * movement_yaw / np.pi)) / 4
+                yaw = math.pi * round((4 * movement_yaw / math.pi)) / 4
             yield (0., yaw, 0.)
 
 
@@ -3390,6 +3426,8 @@ class Entity:
 class AsyncClient:
     def __init__(self, conn):
         self._conn = conn
+        self._read_task = None
+        self._cvar_listener = None
         self._pending_impulse = 0  # deliver via next clc_move (ClanRing ping uses impulse 39)
         # RX/Timing monitors
         self._mono0 = time.monotonic()
@@ -4244,6 +4282,17 @@ class AsyncClient:
                     self.level_name = parsed.level_name
                     self.view_entity = None
                     self.level_finished = False
+                    self.time = None
+                    self.entities.clear()
+                    self.baselines.clear()
+                    self._userinfo_is.clear()
+                    self._latest_ping_by_name.clear()
+                    self._pq_reset_teams()
+                    self._pq_teamgame_hint = False
+                    self._pq_minutes = self._pq_seconds = self._pq_last_time_seen = None
+                    self._pq_paused = False
+                    if self._spawned_fut.done():
+                        self._spawned_fut = asyncio.Future()
                     self.models = parsed.models
                     has_server_info = True
 
@@ -4453,8 +4502,8 @@ class AsyncClient:
                     elif parsed.num == 3:
                         # finish signon
                         await self.send_reliable_raw(_make_cmd_body("begin"))
-                        self._spawned_fut.set_result(None)
-                        self._spawned_fut = asyncio.Future()
+                        if not self._spawned_fut.done():
+                            self._spawned_fut.set_result(None)
 
                 # Set view entity
                 if parsed.msg_type == proto.ServerMessageType.SETVIEW:
@@ -4472,9 +4521,8 @@ class AsyncClient:
                     has_client_update = True
 
                 # Update entity positions
-                if parsed.msg_type == proto.ServerMessageType.SPAWNBASELINE:
-                    if self.view_entity is None:
-                        raise ClientError("View entity not set but spawnbaseline received")
+                if parsed.msg_type in (proto.ServerMessageType.SPAWNBASELINE,
+                                       proto.ServerMessageType.SPAWNBASELINE2):
                     ent = Entity.from_baseline(parsed)
                     self.baselines[parsed.entity_num] = ent
                     # If this looks like a player entity, populate bottomcolor from colormap immediately.
@@ -4559,6 +4607,7 @@ class AsyncClient:
                         try: CON.write("💾 Auto-saved config (disconnect).")
                         except Exception: pass
                     except Exception: pass
+                    return
 
             if has_client_update:
                 self.entities = next_entities
@@ -4579,13 +4628,28 @@ class AsyncClient:
                         demo.add_message(self.angles, msg, has_server_info)
 
     async def wait_for_update(self):
-        await self._updated_fut
+        await asyncio.shield(self._updated_fut)
 
     async def wait_until_spawn(self):
-        await self._spawned_fut
+        await asyncio.shield(self._spawned_fut)
 
     async def wait_for_center_print(self):
-        return await self._center_print_fut
+        return await asyncio.shield(self._center_print_fut)
+
+    def _reader_finished(self, task):
+        exc = None if task.cancelled() else task.exception()
+        if exc is not None:
+            logger.warning("Connection closed: %s", exc)
+        self.disconnected = True
+        self._alive = False
+        for future in (self._spawned_fut, self._updated_fut, self._center_print_fut):
+            if not future.done():
+                future.cancel()
+        if self._cvar_listener is not None:
+            cvar_system.unsubscribe(self._cvar_listener)
+            self._cvar_listener = None
+            self._cvar_subscribed = False
+        self._conn.disconnect()
 
     @classmethod
     async def connect(cls, host, port, joequake_version=None):
@@ -4596,17 +4660,9 @@ class AsyncClient:
         """
         conn = await aiodgram.DatagramConnection.connect(host, port, joequake_version)
 
-        # Always try to send a reliable NOP immediately after connect to flip ackSequence.
-        try:
-            maybe = conn.send_reliable(b"\x01")
-            if inspect.isawaitable(maybe):
-                await maybe
-        except Exception:
-            pass
-
         client = cls(conn)
-        asyncio.create_task(client._read_messages()).add_done_callback(
-                lambda fut: fut.result)
+        client._read_task = asyncio.create_task(client._read_messages())
+        client._read_task.add_done_callback(client._reader_finished)
         return client
 
     def move(self, pitch, yaw, roll, forward, side, up, buttons, impulse=None):
@@ -4663,6 +4719,7 @@ class AsyncClient:
                 except Exception:
                     pass
         cvar_system.subscribe(_on_cvar_changed)
+        self._cvar_listener = _on_cvar_changed
         self._cvar_subscribed = True
 
     async def _push_all_userinfo(self):
@@ -4674,6 +4731,19 @@ class AsyncClient:
             pass
 
     async def disconnect(self):
+        self.disconnected = True
+        self._alive = False
+        if self._read_task is not None:
+            self._read_task.cancel()
+            await asyncio.gather(self._read_task, return_exceptions=True)
+        else:
+            for future in (self._spawned_fut, self._updated_fut, self._center_print_fut):
+                if not future.done():
+                    future.cancel()
+            if self._cvar_listener is not None:
+                cvar_system.unsubscribe(self._cvar_listener)
+                self._cvar_listener = None
+                self._cvar_subscribed = False
         try:
             self._conn.disconnect()
         except Exception:
@@ -4702,8 +4772,6 @@ class AsyncClient:
         If `line` begins with a known alias, expand it and return a list of
         concrete commands to send. Supports $0, $1..$9, and $*; recurses with cap.
         """
-        if depth >= ALIAS_MAX_DEPTH:
-            return None
         try:
             toks = shlex.split(line)
         except Exception:
@@ -4714,6 +4782,8 @@ class AsyncClient:
         body = self.aliases.get(name)
         if body is None:
             return None
+        if depth >= ALIAS_MAX_DEPTH:
+            raise ClientError(f"Alias expansion exceeded {ALIAS_MAX_DEPTH} levels: {name}")
 
         # $-parameter substitution
         def _sub_param(m: re.Match) -> str:
@@ -5102,22 +5172,34 @@ async def _connection_guard(client):
         return
 
 
-async def _aioclient():
-    # Parse command line arguments
-    host = "localhost"
-    port = 26000
-    enable_demo = False
+def _parse_cli_args(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    testing = bool(argv and argv[0] == "test")
+    if testing:
+        argv.pop(0)
+    parser = argparse.ArgumentParser(description="PyQuake-M multiplayer console client")
+    parser.add_argument("host", nargs="?", default="localhost", help="server hostname or IPv4 address")
+    parser.add_argument("port", nargs="?", type=int, default=26000, help="UDP port (default: 26000)")
+    parser.add_argument("--demo", action="store_true", help="record to pyquake.dem")
+    args = parser.parse_args(argv)
+    if not 1 <= args.port <= 65535:
+        parser.error("port must be between 1 and 65535")
+    args.test = testing
+    return args
 
-    if len(sys.argv) >= 2:
-        if sys.argv[1] == "--demo":
-            enable_demo = True
-            if len(sys.argv) >= 4:
-                host, port = sys.argv[2], int(sys.argv[3])
-        else:
-            if len(sys.argv) >= 3:
-                host, port = sys.argv[1], int(sys.argv[2])
 
-        # ---------- Initialize CVAR system (must happen before config loading) ----------
+async def _stop_tasks(*tasks):
+    tasks = [task for task in tasks if task is not None]
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def _aioclient(args=None):
+    args = _parse_cli_args() if args is None else args
+    host, port, enable_demo = args.host, args.port, args.demo
+
+    # ---------- Initialize CVAR system (must happen before config loading) ----------
     global cvar_system
     cvar_system = CvarSystem()
     # a couple of example/handy client cvars (feel free to add more)
@@ -5172,47 +5254,7 @@ async def _aioclient():
     except Exception:
         pass
 
-    # Try some alternative servers if localhost fails
-    alternative_servers = [
-        ("la.quakeone.com", 26002),
-        ("quake.shmack.net", 26000),
-        ("quake.crmod.com", 26003),
-        ("46.165.204.48", 26000),  # de.quakeone.com
-        ("quake.se7en.org", 26000),  # Another known server
-        ("quake.fpsclasico.de", 26000),  # German server
-    ]
-
-    if host == "localhost" and port == 26000:
-        print("💡 localhost:26000 not responding. Trying alternative servers...")
-        for alt_host, alt_port in alternative_servers:
-            print(f"🔄 Trying {alt_host}:{alt_port}...")
-            try:
-                import socket
-                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                sock.settimeout(1.0)
-                sock.sendto(b'\x00\x00\x00\x00\x00', (alt_host, alt_port))
-                sock.close()
-                host, port = alt_host, alt_port
-                print(f"✅ Found responsive server: {host}:{port}")
-                break
-            except:
-                continue
-        else:
-            print("❌ No alternative servers found. Using localhost anyway.")
-
     print(f"🔗 Connecting to {host}:{port}...")
-
-    # Test basic connectivity first
-    try:
-        import socket
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(2.0)
-        sock.sendto(b'\x00\x00\x00\x00\x00', (host, port))
-        sock.close()
-        # UDP connectivity test passed (silent on success)
-    except Exception as e:
-        print(f"UDP connectivity test failed: {e}")
-        print("   This might indicate network/firewall issues")
 
     # --- Ensure userinfo CVARs exist before connecting (so we can push them) ---
     try:
@@ -5620,21 +5662,8 @@ async def _aioclient():
 
                     # -------- disconnect (keep app running) --------
                     if raw.lower() == "disconnect":
-                        if 'hb_task' in locals() and hb_task:
-                            hb_task.cancel()
-                            try: await hb_task
-                            except: pass
-                            hb_task = None
-                        if 'kick_task' in locals() and kick_task:
-                            kick_task.cancel()
-                            try: await kick_task
-                            except: pass
-                            kick_task = None
-                        if 'guard_task' in locals() and guard_task:
-                            guard_task.cancel()
-                            try: await guard_task
-                            except: pass
-                            guard_task = None
+                        await _stop_tasks(hb_task, chatinfo_task, kick_task, guard_task)
+                        hb_task = chatinfo_task = kick_task = guard_task = None
                         # Auto-save before tearing down the connection
                         try:
                             # Always autosave, but only *announce* it when developer=1
@@ -5661,28 +5690,10 @@ async def _aioclient():
                             continue
                         new_host, new_port = target
                         # Tear down existing connection (if any)
-                        if 'hb_task' in locals() and hb_task:
-                            hb_task.cancel()
-                            try:
-                                await hb_task
-                            except:
-                                pass
-                            hb_task = None
-                        if 'kick_task' in locals() and kick_task:
-                            kick_task.cancel()
-                            try:
-                                await kick_task
-                            except:
-                                pass
-                            kick_task = None
-                        if 'guard_task' in locals() and guard_task:
-                            guard_task.cancel()
-                            try:
-                                await guard_task
-                            except:
-                                pass
-                            guard_task = None
-                        if client and not client.disconnected:
+                        await _stop_tasks(hb_task, chatinfo_task, kick_task, guard_task)
+                        hb_task = chatinfo_task = kick_task = guard_task = None
+                        _set_current_client(None)
+                        if client:
                             # Auto-save before reconnect teardown (counts as a disconnect)
                             try:
                                 _autosave_config()
@@ -5697,10 +5708,13 @@ async def _aioclient():
                         print(f"🔁 Reconnecting to {new_host}:{new_port}...")
                         try:
                             client = await AsyncClient.connect(new_host, new_port)
+                            client._bind_cvar_subscriptions()
+                            _set_current_client(client)
                             # restart background tasks
                             hb_task = asyncio.create_task(_simple_keep_alive(client))
                             chatinfo_task = asyncio.create_task(_watch_chatinfo(client))
                             kick_task = asyncio.create_task(_kickstart_handshake(client))
+                            guard_task = asyncio.create_task(_connection_guard(client))
                             # keep last_connect_spec unchanged (still points to this target)
                             try:
                                 await asyncio.wait_for(client.wait_until_spawn(), timeout=20.0)
@@ -5712,7 +5726,7 @@ async def _aioclient():
                         continue
 
                     # -------- connect host[:port] / connect last --------
-                    if raw.lower().startswith("connect"):
+                    if re.match(r"(?i)^connect(?:\s|$)", raw):
                         parts = raw.split(maxsplit=1)
                         if len(parts) == 1 or not parts[1].strip():
                             print("Usage: connect host[:port]   or   connect last")
@@ -5727,15 +5741,17 @@ async def _aioclient():
                             continue
                         new_host, new_port = target
                         # Clean up any existing connection
-                        if client and not client.disconnected:
-                            if 'hb_task' in locals() and hb_task: hb_task.cancel();
-                            if 'kick_task' in locals() and kick_task: kick_task.cancel();
-                            if 'guard_task' in locals() and guard_task: guard_task.cancel();
+                        await _stop_tasks(hb_task, chatinfo_task, kick_task, guard_task)
+                        hb_task = chatinfo_task = kick_task = guard_task = None
+                        _set_current_client(None)
+                        if client:
                             try: await client.disconnect()
                             except Exception: pass
                         print(f"🔗 Connecting to {new_host}:{new_port}...")
                         try:
                             client = await AsyncClient.connect(new_host, new_port)
+                            client._bind_cvar_subscriptions()
+                            _set_current_client(client)
                             # restart background tasks
                             hb_task = asyncio.create_task(_simple_keep_alive(client))
                             chatinfo_task = asyncio.create_task(_watch_chatinfo(client))
@@ -5901,7 +5917,7 @@ async def _aioclient():
                                 CON.write(f"(offline) {line}")
                             # (nothing else to do in offline mode)
 
-            except KeyboardInterrupt:
+            except (KeyboardInterrupt, EOFError):
                 print("\nDisconnecting...")
                 break
             except Exception as e:
@@ -5952,7 +5968,7 @@ async def _aioclient():
         # else: demo recording disabled - silent cleanup
 
 
-def aioclient_main():
+def aioclient_main(args=None):
     logging.basicConfig(level=logging.INFO, format='%(message)s')
 
     # --- Quiet unreliable message skips (safest, fastest) ---
@@ -5960,17 +5976,17 @@ def aioclient_main():
         _pat = re.compile(r"^Skipped -?\d+ unreliable messages$")
         def filter(self, record: logging.LogRecord) -> bool:
             try:
-                if record.name not in ("aiodgram", "proto", "netchan"):
+                if record.name not in (aiodgram.__name__, proto.__name__, "netchan"):
                     return True
                 msg = record.getMessage()
                 return not (isinstance(msg, str) and self._pat.match(msg))
             except Exception:
                 return True
 
-    logging.getLogger("aiodgram").addFilter(_SilenceUnreliableSkips())
-    logging.getLogger("proto").addFilter(_SilenceUnreliableSkips())
+    logging.getLogger(aiodgram.__name__).addFilter(_SilenceUnreliableSkips())
+    logging.getLogger(proto.__name__).addFilter(_SilenceUnreliableSkips())
     # Optional: turn the whole module down
-    logging.getLogger("aiodgram").setLevel(logging.WARNING)
+    logging.getLogger(aiodgram.__name__).setLevel(logging.WARNING)
 
     # Ensure retired CVARs are purged
     try:
@@ -5978,7 +5994,7 @@ def aioclient_main():
     except Exception:
         pass
     try:
-        asyncio.run(_aioclient())
+        asyncio.run(_aioclient(args))
     except asyncio.CancelledError:
         pass
 
@@ -5988,19 +6004,7 @@ async def test_connection(host, port):
     print(f"🧪 Testing connection to {host}:{port}...")
 
     try:
-        import socket
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(2.0)
-        sock.sendto(b'\x00\x00\x00\x00\x00', (host, port))
-        sock.close()
-        print("✅ UDP connectivity: OK")
-    except Exception as e:
-        print(f"❌ UDP connectivity: FAILED ({e})")
-        return
-
-    try:
-        from aiodgram import DatagramConnection
-        conn = await DatagramConnection.connect(host, port)
+        conn = await aiodgram.DatagramConnection.connect(host, port)
         print("✅ Quake protocol connection: OK")
 
         # Try to send a simple command
@@ -6089,21 +6093,8 @@ def _do_infotest() -> None:
         CON.write("-- scoreboard empty --")
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "test":
-        # Run simple connectivity test
-        host = sys.argv[2] if len(sys.argv) > 2 else "la.quakeone.com"
-        port = int(sys.argv[3]) if len(sys.argv) > 3 else 26002
-        asyncio.run(test_connection(host, port))
-    elif len(sys.argv) == 1 or (len(sys.argv) == 2 and sys.argv[1] in ["-h", "--help"]):
-        print("PyQuake Client")
-        print("Usage:")
-        print("  python client.py [host] [port]     - Connect to server (no demo)")
-        print("  python client.py --demo [host] [port] - Connect with demo recording")
-        print("  python client.py test [host] [port]   - Test connectivity only")
-        print("  python client.py --help              - Show this help")
-        print("")
-        print("Examples:")
-        print("  python client.py la.quakeone.com 26002")
-        print("  python client.py --demo localhost 26000")
+    args = _parse_cli_args(sys.argv[1:] or ["--help"])
+    if args.test:
+        asyncio.run(test_connection(args.host, args.port))
     else:
-        aioclient_main()
+        aioclient_main(args)

@@ -1,2 +1,4 @@
 # Vim swap files
 *.sw[opnm]
+__pycache__/
+*.py[cod]
