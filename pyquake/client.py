@@ -1274,7 +1274,7 @@ def _split_queued_commands(s: str) -> list[str]:
 _RESERVED_CMDS = frozenset({
     "help","cmdlist","aliaslist","clear","quit","exit","q","scoreboard","extip","disconnect","connect","reconnect","demo","kill","status",
     "players","showscores","ping","impulse","name","color","say","say_team","tell","dm","pm","like",
-    "condump","echo","exec","ip","extip","port","random",
+    "condump","echo","exec","ip","extip","port","random","cmd","rcon",
     "reset","resetall","resetcfg","s","st","net_stats","unalias","unaliasall","wait",
     # say_random / say_rand slots (reserve so servers can't shadow)
     "version",
@@ -2191,7 +2191,8 @@ def _print_cmdlist():
     """Print unified command list for the interactive console."""
     print("\nCommands:")
     print("  (input)             - Commands by default; use say/s for chat")
-    print("  cl_chatmode 0..3    - 0=commands, 1=auto chat, 2=chat-first, 3=space chats")
+    print("  cl_chatmode 0..3     - 0=commands, 1=auto chat, 2=chat-first, 3=space chats")
+    print("  /command            - Force a command in any chat mode")
     print("  help                - Show this command list")
     print("  version             - Show client version tag")
     print("  echo <text>         - Print text locally")

@@ -30,7 +30,7 @@ class ConsoleSession:
         self.enable_demo = False
         self.connecting = False
         for name, value, kind, description in (
-            ("cl_chatmode", "0", api.CvarType.INT, "0=commands, 1=auto chat, 2=chat with leading space, 3=leading-space chat"),
+            ("cl_chatmode", "0", api.CvarType.INT, "0=commands, 1=auto chat, 2=chat-first (prefilled space), 3=leading-space chat"),
             ("cfg_save_aliases", "1", api.CvarType.BOOL, "Save command aliases in config.cfg"),
             ("cl_aliasoverlap", "0", api.CvarType.BOOL, "Allow aliases to overlap cvar names"),
         ):
@@ -41,7 +41,7 @@ class ConsoleSession:
                                              description=description))
         self.dispatcher = CommandDispatcher(
             aliases=self.aliases, handle=self.handle, forward=self.forward,
-            is_command=self.is_command, chat_mode=lambda: int(self.cvars.get_value("cl_chatmode")),
+            is_command=self.is_command, chat_mode=self.chat_mode,
             wait_frame=api._wait_next_frame, output=api.CON.write,
             reserved=lambda name: name in api._RESERVED_CMDS or name in self.cvars._commands,
             max_depth=api.ALIAS_MAX_DEPTH)
@@ -49,6 +49,13 @@ class ConsoleSession:
     @property
     def client(self):
         return self.api.CURRENT_CLIENT
+
+    def chat_mode(self):
+        # QSS-M only converts console input to chat while connected.
+        active = self.client
+        if active is None or not active._alive or active.disconnected:
+            return 0
+        return int(self.cvars.get_value("cl_chatmode"))
 
     def is_command(self, text):
         commands = split_commands(text)

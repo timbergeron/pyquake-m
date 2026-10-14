@@ -144,8 +144,8 @@ class CommandDispatcher:
         if not stripped or stripped.startswith("//"):
             return text
         mode = self.chat_mode()
-        if ((mode in (1, 2) and not self.is_command(text))
-                or (mode in (2, 3) and text[:1].isspace())):
+        if ((mode in (1, 2) and (text[:1].isspace() or not self.is_command(text)))
+                or (mode == 3 and text.startswith(" "))):
             return "say " + quote_arg(text.strip())
         return text
 

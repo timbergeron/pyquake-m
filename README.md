@@ -33,9 +33,11 @@ Input defaults to commands (`cl_chatmode 0`), so `ready` reaches the server as a
 | Value | Behavior |
 | --- | --- |
 | `0` | Command input; chat uses `say` or `s`. |
-| `1` | Unknown input becomes chat; known commands, cvars, and aliases still execute. Use `/command` to force a server command. |
+| `1` | Unknown input becomes chat; known commands, cvars, and aliases still execute. A leading space forces chat. |
 | `2` | Automatic chat, with a leading space prefilled when readline is available. Remove the space to enter a known command. |
 | `3` | A leading space sends chat; unspaced input executes commands. |
+
+These modes follow QSS-M's console chat behavior while connected. Offline input always executes as commands. Use `/command` to force a command in any mode, including after a prefilled space. In modes `2` and `3`, readline prefills a space; delete it to type commands. Without readline, add the space manually.
 
 Scripts, aliases, and queued commands always execute as commands. They share the console's dispatcher, including local commands, cvars, nested `exec`, semicolon batches, and `wait [frames]`. Quotes preserve semicolons; `//` starts a comment outside quotes after whitespace.
 

@@ -69,6 +69,65 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         await self.execute(" ready")
         self.assertEqual(self.messages(), ['say "hello"', "ready", 'say "ready"', "custom_mod_command", 'say "hello"', 'say "ready"'])
 
+    async def test_leading_space_forces_chat_in_all_enabled_modes(self):
+        await self.execute('alias go ready; seta greeting hello')
+        for mode in range(4):
+            with self.subTest(mode=mode):
+                self.conn.sent.clear()
+                self.console.reset_mock()
+                self.cvars.set("cl_chatmode", str(mode))
+                self.cvars.set("greeting", "hello")
+                for line in (" ready", " echo hello", " greeting goodbye", " go"):
+                    await self.execute(line)
+                if mode:
+                    self.assertEqual(self.messages(), [
+                        'say "ready"', 'say "echo hello"',
+                        'say "greeting goodbye"', 'say "go"'])
+                    self.assertEqual(self.cvars.get_string("greeting"), "hello")
+                    self.assertEqual(self.output(), [])
+                else:
+                    self.assertEqual(self.messages(), ["ready", "ready"])
+                    self.assertEqual(self.cvars.get_string("greeting"), "goodbye")
+                    self.assertIn("hello", self.output())
+
+    async def test_disconnected_input_stays_commands_in_all_chat_modes(self):
+        for mode in (1, 2, 3):
+            for active, alive, disconnected in ((None, True, False),
+                                                (self.active, True, True),
+                                                (self.active, False, False)):
+                with self.subTest(mode=mode, client=active, alive=alive, disconnected=disconnected), \
+                        mock.patch.object(client, "CURRENT_CLIENT", active), \
+                        mock.patch.object(self.active, "_alive", alive), \
+                        mock.patch.object(self.active, "disconnected", disconnected):
+                    self.console.reset_mock()
+                    self.cvars.set("cl_chatmode", str(mode))
+                    await self.execute(" echo offline")
+                    await self.execute(" custom_mod_command arg")
+                    self.assertEqual(self.output(), ["offline", "(offline) custom_mod_command arg"])
+        self.assertEqual(self.messages(), [])
+
+    async def test_chat_modes_recognize_cmd_and_rcon(self):
+        for mode in (1, 2):
+            with self.subTest(mode=mode), \
+                    mock.patch.object(self.active, "send_rcon_nq", new_callable=mock.AsyncMock) as rcon:
+                self.conn.sent.clear()
+                self.cvars.set("cl_chatmode", str(mode))
+                await self.execute("cmd custom_mod_command arg")
+                await self.execute("rcon status")
+                self.assertEqual(self.messages(), ["custom_mod_command arg"])
+                rcon.assert_awaited_once_with("status")
+
+    async def test_slash_forces_commands_after_chat_prefill(self):
+        for mode in (1, 2, 3):
+            with self.subTest(mode=mode):
+                self.conn.sent.clear()
+                self.console.reset_mock()
+                self.cvars.set("cl_chatmode", str(mode))
+                await self.execute(" /custom_mod_command arg")
+                await self.execute(" /echo local")
+                self.assertEqual(self.messages(), ["custom_mod_command arg"])
+                self.assertIn("local", self.output())
+
     async def test_scripts_and_aliases_never_inherit_automatic_chat(self):
         script = self.directory / "commands.cfg"
         script.write_text('alias go "custom_mod_command fromalias"\ngo\ncustom_mod_command fromconfig\n')
