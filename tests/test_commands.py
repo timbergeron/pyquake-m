@@ -319,11 +319,28 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_startup_config_uses_shared_dispatcher_before_connection(self):
         config = self.directory / "startup.cfg"
-        config.write_text('seta custom yes\nalias warmup "ready"\ncl_chatmode 1\n')
-        self.cvars._config_file = str(config)
+        saved_settings = {
+            "bottomcolor": "0", "cl_afk_idle": "25", "cl_aliasoverlap": "0",
+            "cl_idle": "2", "con_logcenterprint": "1", "developer": "0",
+            "name": "pyquake-m", "net_connecttimeout": "17",
+            "net_hostport": "26001", "net_messagetimeout": "450", "topcolor": "0",
+            "cl_chatmode": "1",
+        }
+        config.write_text('seta custom yes\nalias warmup "ready"\n' + ''.join(
+            f'{name} "{value}"\n' for name, value in saved_settings.items()))
+        startup_cvars = client.CvarSystem()
+        startup_cvars._config_file = str(config)
         client.CURRENT_CLIENT = None
-        replacement = client.AsyncClient(FakeConnection())
-        replacement._spawned_fut.set_result(None)
+        settings_at_connect = {}
+        replacement = None
+
+        async def connect(host, port):
+            nonlocal replacement
+            settings_at_connect.update({name: startup_cvars.get_string(name)
+                                        for name in saved_settings})
+            replacement = client.AsyncClient(FakeConnection())
+            replacement._spawned_fut.set_result(None)
+            return replacement
 
         async def input_without_thread(executor, function, prompt):
             await asyncio.sleep(0)
@@ -332,17 +349,23 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         async def background(active):
             await asyncio.Event().wait()
 
-        with mock.patch.object(client, "CvarSystem", return_value=self.cvars), \
-                mock.patch.object(client.AsyncClient, "connect", return_value=replacement), \
+        with mock.patch.object(client, "CvarSystem", return_value=startup_cvars), \
+                mock.patch.object(client.platform, "system", return_value="Darwin"), \
+                mock.patch.object(client.AsyncClient, "connect", side_effect=connect), \
                 mock.patch.object(client, "_simple_keep_alive", background), \
                 mock.patch.object(client, "_watch_chatinfo", background), \
                 mock.patch.object(client, "_kickstart_handshake", background), \
                 mock.patch.object(client, "_connection_guard", background), \
                 mock.patch.object(asyncio.get_running_loop(), "run_in_executor", input_without_thread), \
-                mock.patch("builtins.input", side_effect=["warmup", "quit"]), mock.patch("builtins.print"):
+                mock.patch("builtins.input", side_effect=["warmup", "quit"]), \
+                mock.patch("builtins.print") as output:
             await asyncio.wait_for(client._aioclient(client._parse_cli_args(["localhost"])), 1)
-        self.assertEqual(self.cvars.get_string("custom"), "yes")
-        self.assertIn("warmup", self.cvars.command_aliases)
+        self.assertEqual(settings_at_connect, saved_settings)
+        output.assert_called_once_with("\n========= PyQuake-M Initialized =========\n")
+        self.assertEqual(self.output(), ["Connecting to localhost:26000..."])
+        self.assertEqual(startup_cvars.get_string("custom"), "yes")
+        self.assertIn("warmup", startup_cvars.command_aliases)
+        self.assertIs(startup_cvars.find("con_logcenterpint"), startup_cvars.find("con_logcenterprint"))
         self.assertIn(b"\x04ready\0", replacement._conn.sent)
         self.assertTrue(replacement._conn.closed)
         await self.active.disconnect()

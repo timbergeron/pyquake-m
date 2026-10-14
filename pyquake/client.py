@@ -485,7 +485,6 @@ class CvarSystem:
                 print(f'"{cvar.name}" is "{cvar.string}" (default: "{cvar.default_string}")')
             return True
         new_value = ' '.join(command_args[1:])
-        print(f'changing "{cvar.name}" from "{cvar.string}" to "{new_value}"')
         self.set(cvar.name, new_value)
         return True
 
@@ -731,6 +730,23 @@ def _ensure_developer_cvar() -> None:
             ))
     except Exception:
         # cvar_system may not be initialized yet; that's ok.
+        pass
+
+def _ensure_centerprint_cvar() -> None:
+    """Register centerprint logging and its compatibility alias before config loading."""
+    try:
+        if cvar_system.find("con_logcenterprint") is None:
+            cvar_system.register(Cvar(
+                "con_logcenterprint", "0",
+                flags=CvarFlags.ARCHIVE,
+                cvar_type=CvarType.BOOL,
+                description="Log centerprints to console (deduped). 0=off, 1=on"
+            ))
+        cv = cvar_system.find("con_logcenterprint")
+        if cv and cvar_system.find("con_logcenterpint") is None:
+            cvar_system.register_alias(cv, "con_logcenterpint")
+    except Exception:
+        # Standalone clients may be created without a global cvar system.
         pass
 
 def _dev_enabled() -> bool:
@@ -3129,22 +3145,7 @@ class AsyncClient:
         self._cvar_subscribed = False
 
         # --- Centerprint logging control (default: suppressed) ---
-        # Register cvar lazily to avoid boot-order issues.
-        try:
-            if cvar_system.find("con_logcenterprint") is None:
-                cvar_system.register(Cvar(
-                    "con_logcenterprint",
-                    "0",
-                    flags=CvarFlags.ARCHIVE,
-                    cvar_type=CvarType.BOOL,
-                    description="Log centerprints to console (deduped). 0=off, 1=on"
-                ))
-            # Friendly alias for the common typo ("pint" -> "print") without noise.
-            cv = cvar_system.find("con_logcenterprint")
-            if cv and cvar_system.find("con_logcenterpint") is None:
-                cvar_system.register_alias(cv, "con_logcenterpint")
-        except Exception:
-            pass
+        _ensure_centerprint_cvar()
         # Keep last logged centerprint to suppress identical spam bursts.
         self._last_centerprint_logged: str | None = None
 
@@ -4803,6 +4804,14 @@ async def _aioclient(args=None):
     # RCON password CVAR
     cvar_system.register(Cvar("rcon_password", "", CvarFlags.NONE,
                               cvar_type=CvarType.STRING, description="Remote console password for RCON control packets"))
+
+    # Register archived settings before loading config.cfg, including those
+    # also initialized lazily for programmatic clients.
+    _ensure_developer_cvar()
+    _ensure_centerprint_cvar()
+    _ensure_timeout_cvars()
+    _ensure_cl_idle_cvar()
+    _ensure_net_hostport_cvar()
 
     # Allow alias names to overlap CVAR names? 0=no (default, will rename to *_a on conflict), 1=yes
     if cvar_system.find("cl_aliasoverlap") is None:
