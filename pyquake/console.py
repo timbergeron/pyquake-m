@@ -13,9 +13,11 @@ import tempfile
 import time
 
 if __package__:
+    from .terminal_input import TerminalInput, supported as terminal_input_supported
     from .commands import CommandDispatcher, alias_key, define_alias, quote_arg, split_commands
     from .iplog import IpLog, address_prefix, format_address
 else:
+    from terminal_input import TerminalInput, supported as terminal_input_supported
     from commands import CommandDispatcher, alias_key, define_alias, quote_arg, split_commands
     from iplog import IpLog, address_prefix, format_address
 
@@ -30,6 +32,8 @@ SERVER_COMMANDS = frozenset({
 class ConsoleSession:
     def __init__(self, api):
         self.api = api
+        self._terminal_input = TerminalInput(complete=self._complete_input,
+                                            activity=api._mark_activity)
         api.register_download_cvars(api)
         self.cvars = api.cvar_system
         self._offline_downloads = api.DownloadManager(None, self.cvars, api.CON.write)
@@ -742,8 +746,25 @@ class ConsoleSession:
             if key.casefold() != name.casefold():
                 q.CON.write(f"Alias renamed to {key} due to command/cvar conflict")
 
+    def _complete_input(self, context, prefix):
+        q = self.api
+        tokens = context.rsplit(";", 1)[-1].split()
+        mode = q._tabcomp_mode_for_line(tokens)
+        return sorted(q._tabcomp_candidates(prefix, mode=mode,
+                                           first_token=tokens[0] if tokens else None),
+                      key=lambda name: (len(name), name.lower()))
+
     def read_line(self, prompt):
         q = self.api
+        if terminal_input_supported():
+            initial = getattr(q, "_TERMINAL_PREFILL", "")
+            if not q._EDIT_PREFILL and int(self.cvars.get_value("cl_chatmode")) in (2, 3):
+                initial = " "
+            try:
+                return self._terminal_input.read(initial)
+            finally:
+                q._TERMINAL_PREFILL = ""
+                q._EDIT_PREFILL = False
         prefill = (int(self.cvars.get_value("cl_chatmode")) in (2, 3)
                    and q._readline is not None and not q._EDIT_PREFILL)
         if prefill:

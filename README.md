@@ -121,6 +121,13 @@ The scoreboard understands ProQuake team scores and match clocks, including
 pauses, sudden death (`SD`), and negative countdowns. Private messages and other
 forwarded commands require support from the server.
 
+On UTF-8 POSIX terminals, the input has a white `❯` prompt, a dark highlighted
+editing area, and full-width gray rules. It grows as text wraps and redraws below
+incoming server messages. Use arrow keys to edit or recall history, Tab to
+complete commands, and Alt+Enter to insert a newline; Enter submits the input.
+Multiline bracketed pastes stay editable until submitted. Other terminals and
+redirected input use the standard readline/input prompt.
+
 ### Choose your chat style
 
 The archived `cl_chatmode` variable follows QSS-M's console chat behavior:

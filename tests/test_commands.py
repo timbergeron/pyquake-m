@@ -694,6 +694,30 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
             self.session.read_line("> ")
         readline.set_startup_hook.assert_not_called()
 
+    async def test_styled_prompt_keeps_chat_space_editable(self):
+        for mode in (0, 1, 2, 3):
+            with self.subTest(mode=mode):
+                self.cvars.set("cl_chatmode", str(mode))
+                with mock.patch("pyquake.console.terminal_input_supported", return_value=True), \
+                        mock.patch.object(self.session._terminal_input, "read", return_value=" ready") as read:
+                    self.assertEqual(self.session.read_line("> "), " ready")
+                read.assert_called_once_with(" " if mode in (2, 3) else "")
+
+    async def test_styled_prompt_preserves_alias_edit_prefill(self):
+        await self.execute('alias go "ready"; cl_chatmode 3')
+        with mock.patch("pyquake.console.terminal_input_supported", return_value=True), \
+                mock.patch.object(client, "terminal_input_supported", return_value=True), \
+                mock.patch.object(self.session._terminal_input, "read", return_value="alias go ready") as read:
+            await self.execute("aliasedit go")
+            self.session.read_line("> ")
+            read.assert_called_once_with('alias "go" "ready"')
+            self.assertFalse(client._EDIT_PREFILL)
+            self.assertEqual(client._TERMINAL_PREFILL, "")
+
+    async def test_styled_completion_starts_a_new_command_after_semicolon(self):
+        self.assertIn("status", self.session._complete_input("set name woods; ", "sta"))
+        self.assertIn("cl_chatmode", self.session._complete_input("set ", "cl_chat"))
+
     async def test_chatmode_space_is_part_of_the_editable_input(self):
         readline = mock.Mock()
 

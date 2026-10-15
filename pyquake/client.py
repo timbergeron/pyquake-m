@@ -61,7 +61,7 @@ if __package__:
     from .downloads import DownloadError, DownloadManager, register_cvars as register_download_cvars
     from .iplog import IpLog, StatusParser
     from .commands import define_alias, split_commands, quote_arg
-    from .console import ConsoleSession, SERVER_COMMANDS
+    from .console import ConsoleSession, SERVER_COMMANDS, terminal_input_supported
 else:
     from demo import Demo, recover_demo
     from downloads import DownloadError, DownloadManager, register_cvars as register_download_cvars
@@ -69,7 +69,7 @@ else:
     import proto
     from iplog import IpLog, StatusParser
     from commands import define_alias, split_commands, quote_arg
-    from console import ConsoleSession, SERVER_COMMANDS
+    from console import ConsoleSession, SERVER_COMMANDS, terminal_input_supported
 from typing import Union
 
 # --- Windows UDP reliability: use SelectorEventLoop instead of Proactor ---
@@ -867,6 +867,7 @@ _sayrand_next: list[int] = [0]*10
 # All console and script entry points share the active session's dispatcher.
 _CONSOLE_SESSION = None
 _EDIT_PREFILL = False
+_TERMINAL_PREFILL = ""
 
 
 def _get_console_session():
@@ -2674,8 +2675,12 @@ async def _handle_local_command(line: str) -> bool:
             return True
         final_cmd = f"alias {quote_arg(alias_name)} {quote_arg(body.rstrip())}"
 
-        # Try to prefill the *next* input line using readline (POSIX).
+        # Prefill the next styled or readline input for editing.
         def _prefill_next_input(s: str) -> bool:
+            if terminal_input_supported():
+                globals()["_TERMINAL_PREFILL"] = s
+                globals()["_EDIT_PREFILL"] = True
+                return True
             if _readline:
                 def _hook():
                     try:
