@@ -29,6 +29,30 @@ def cell_width(char):
     return 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
 
 
+def format_completions(candidates, width, colmax=0, direction=0):
+    """Lay out QSS-M-style columns, reading down each column by default."""
+    if not candidates:
+        return ""
+    lengths = [sum(cell_width(char) for char in name) for name in candidates]
+    stride = (max(8, max(lengths) + 3) + 3) // 4 * 4
+    columns = max(1, width // stride)
+    if colmax >= 1:
+        columns = min(columns, int(colmax))
+    if len(candidates) < 6:
+        columns = 1
+    columns = min(columns, len(candidates))
+    rows = (len(candidates) + columns - 1) // columns
+    lines = []
+    for row in range(rows):
+        cells = []
+        for column in range(columns):
+            index = row * columns + column if direction == 1 else column * rows + row
+            if index < len(candidates):
+                cells.append("  " + candidates[index] + " " * (stride - 2 - lengths[index]))
+        lines.append("".join(cells).rstrip())
+    return "\n".join(lines) + "\n"
+
+
 def layout(text, cursor, width):
     """Wrap inside the highlighted area, returning rows and a cell cursor."""
     capacity = max(2, width - 6)  # two left spaces, chevron, gap, two right spaces
@@ -84,8 +108,10 @@ class _Output:
 
 
 class TerminalInput:
-    def __init__(self, *, complete, history=None, activity=lambda: None):
+    def __init__(self, *, complete, history=None, activity=lambda: None,
+                 completion_options=lambda: (0, 0)):
         self.complete = complete
+        self.completion_options = completion_options
         self.history = history if history is not None else []
         self.activity = activity
         self.lock = threading.RLock()
@@ -168,9 +194,10 @@ class TerminalInput:
         replacement = os.path.commonprefix(candidates)
         if len(candidates) == 1:
             replacement += " "
-        elif replacement == prefix:
+        else:
             # Show choices through the same output path used by server messages.
-            sys.stdout.write("  " + "  ".join(candidates) + "\n")
+            sys.stdout.write(format_completions(candidates, self._size()[0],
+                                                *self.completion_options()))
         self.text = self.text[:start] + replacement + self.text[self.cursor:]
         self.cursor = start + len(replacement)
 

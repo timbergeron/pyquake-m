@@ -1,7 +1,9 @@
 import asyncio
 import io
 import math
+from pathlib import Path
 import struct
+import tempfile
 import unittest
 from unittest import mock
 
@@ -432,6 +434,10 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_console_reconnect_uses_new_client_and_cleans_up_tasks(self):
         connections = []
         background_tasks = []
+        temporary = tempfile.TemporaryDirectory(prefix="pyquake-reconnect-", dir=Path(__file__).resolve().parents[1])
+        self.addCleanup(temporary.cleanup)
+        startup_cvars = client.CvarSystem()
+        startup_cvars._config_file = str(Path(temporary.name) / "config.cfg")
 
         async def connect(host, port):
             connection = FakeConnection()
@@ -452,6 +458,7 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
 
         with mock.patch.object(client.AsyncClient, "connect", side_effect=connect), \
                 mock.patch.object(client.CvarSystem, "load_config", return_value=False), \
+                mock.patch.object(client, "CvarSystem", return_value=startup_cvars), \
                 mock.patch.object(client, "_simple_keep_alive", background), \
                 mock.patch.object(client, "_watch_chatinfo", background), \
                 mock.patch.object(client, "_kickstart_handshake", background), \

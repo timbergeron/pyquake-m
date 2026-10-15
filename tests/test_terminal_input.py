@@ -10,7 +10,37 @@ import time
 import unittest
 from unittest import mock
 
-from pyquake.terminal_input import TerminalInput, layout, supported
+from pyquake.terminal_input import TerminalInput, format_completions, layout, supported
+
+
+class CompletionLayoutTests(unittest.TestCase):
+    def test_columns_fill_down_and_fit_terminal_width(self):
+        names = [f"a{i}" for i in range(1, 8)]
+        self.assertEqual(format_completions(names, 24),
+                         "  a1      a4      a7\n  a2      a5\n  a3      a6\n")
+        self.assertEqual(format_completions(names, 8),
+                         "".join(f"  {name}\n" for name in names))
+
+    def test_column_limit_and_horizontal_direction(self):
+        names = [f"a{i}" for i in range(1, 8)]
+        self.assertEqual(format_completions(names, 80, 2),
+                         "  a1      a5\n  a2      a6\n  a3      a7\n  a4\n")
+        self.assertEqual(format_completions(names, 80, 1),
+                         "".join(f"  {name}\n" for name in names))
+        self.assertEqual(format_completions(names, 80, 2, 1),
+                         "  a1      a2\n  a3      a4\n  a5      a6\n  a7\n")
+
+    def test_small_lists_and_long_names_use_one_column(self):
+        self.assertEqual(format_completions(["alpha", "beta"], 80), "  alpha\n  beta\n")
+        names = ["long_server_address" + str(i) for i in range(6)]
+        self.assertEqual(format_completions(names, 8),
+                         "".join(f"  {name}\n" for name in names))
+        self.assertEqual(format_completions([], 80), "")
+
+    def test_unicode_alignment_uses_cell_width(self):
+        names = ["界", "a", "e\u0301", "b", "c", "d"]
+        self.assertEqual(format_completions(names, 16),
+                         "  界      b\n  a       c\n  e\u0301       d\n")
 
 
 class LayoutTests(unittest.TestCase):
@@ -47,7 +77,7 @@ class LayoutTests(unittest.TestCase):
 
 @unittest.skipUnless(os.name == "posix", "POSIX terminal editor")
 class TerminalTests(unittest.TestCase):
-    def start_editor(self, *, count=1, server=False):
+    def start_editor(self, *, count=1, server=False, candidates=None):
         import fcntl
         import pty
         import struct
@@ -62,7 +92,9 @@ import json, sys, termios, threading
 from pyquake.terminal_input import TerminalInput
 saved = termios.tcgetattr(0)
 typed = threading.Event()
-editor = TerminalInput(complete=lambda context, prefix: ["status"] if prefix == "sta" else [],
+editor = TerminalInput(complete=lambda context, prefix: (
+                           {candidates!r} if {candidates is not None!r}
+                           else ["status"] if prefix == "sta" else []),
                        activity=typed.set)
 def server():
     typed.wait(3)
@@ -118,6 +150,13 @@ finally:
         self.start_editor(count=3)
         self.send("sta\t\r\x1b[A\x01/\x05\x7f\rnext\r")
         self.assertEqual(self.finish(), ["status ", "/status", "next"])
+
+    def test_ambiguous_completion_prints_vertical_list_and_keeps_editing(self):
+        self.start_editor(candidates=["stats", "status"])
+        self.send("sta\t")
+        self.wait_for("  stats\r\n  status\r\n")
+        self.send("us\r")
+        self.assertEqual(self.finish(), ["status"])
 
     def test_multiline_paste_does_not_execute_and_filters_controls(self):
         self.start_editor()

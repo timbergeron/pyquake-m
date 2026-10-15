@@ -2,6 +2,7 @@
 
 import asyncio
 import ctypes
+from datetime import datetime, timezone
 import fnmatch
 import inspect
 import json
@@ -33,12 +34,19 @@ class ConsoleSession:
     def __init__(self, api):
         self.api = api
         self._terminal_input = TerminalInput(complete=self._complete_input,
-                                            activity=api._mark_activity)
+                                            activity=api._mark_activity,
+                                            completion_options=lambda: (
+                                                self.cvars.get_value("con_colmax"),
+                                                self.cvars.get_value("con_coldirection")))
         api.register_download_cvars(api)
         self.cvars = api.cvar_system
         self._offline_downloads = api.DownloadManager(None, self.cvars, api.CON.write)
         self.aliases = self.cvars.command_aliases
-        self.last_connect_spec = None
+        self.server_history = []
+        self._server_history_path = Path(self.cvars._config_file).expanduser().resolve().parent / "servers.json"
+        self._server_history_writable = True
+        self._load_server_history()
+        self.last_connect_spec = self.server_history[0]["address"] if self.server_history else None
         self.tasks = ()
         self.demo = None
         self.demo_path = Path("pyquake.dem")
@@ -68,6 +76,10 @@ class ConsoleSession:
                                              maximum=3 if name == "cl_chatmode" else 1,
                                              description=description))
         for name, value, kind, flags, minimum, maximum, description in (
+            ("con_colmax", "0", api.CvarType.INT, api.CvarFlags.ARCHIVE, 0, None,
+             "Maximum completion columns: 0=fit terminal width, 1=vertical list"),
+            ("con_coldirection", "0", api.CvarType.INT, api.CvarFlags.ARCHIVE, 0, 1,
+             "Completion order: 0=top to bottom, 1=left to right"),
             ("cl_autodemo", "0", api.CvarType.INT, api.CvarFlags.ARCHIVE, 0, 4,
              "0=off, 1=all maps, 2=matches, 3=multiplayer maps, 4=maps with cuts"),
             ("cl_demo_minframes", "0", api.CvarType.INT, api.CvarFlags.ARCHIVE, None, None,
@@ -303,6 +315,55 @@ class ConsoleSession:
                 except OSError:
                     pass
 
+    def _load_server_history(self):
+        try:
+            entries = json.loads(self._server_history_path.read_text(encoding="utf-8"))
+            if not isinstance(entries, list):
+                raise ValueError("expected an array of servers")
+            history, seen = [], set()
+            for entry in entries:
+                address = entry.get("address") if isinstance(entry, dict) else None
+                if not isinstance(address, str):
+                    continue
+                target = self.api._parse_hostport_spec(address, default_port=26000)
+                if target is None:
+                    continue
+                address = f"{target[0]}:{target[1]}"
+                if address.casefold() not in seen:
+                    seen.add(address.casefold())
+                    history.append({"address": address, "last_connected": entry.get("last_connected")})
+            self.server_history = history
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as exc:
+            # Preserve unreadable history rather than overwrite it on connect.
+            self._server_history_writable = False
+            self.api.CON.write(f"Could not read server history: {exc}")
+
+    def _record_server(self, address):
+        self.server_history = [{"address": address,
+                                "last_connected": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}] + [
+            entry for entry in self.server_history if entry["address"].casefold() != address.casefold()]
+        if not self._server_history_writable:
+            return
+        temporary = None
+        try:
+            self._server_history_path.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=self._server_history_path.parent,
+                                             prefix=".servers-", delete=False) as output:
+                temporary = Path(output.name)
+                json.dump(self.server_history, output, indent=2)
+                output.write("\n")
+            os.replace(temporary, self._server_history_path)
+        except (OSError, ValueError) as exc:
+            self.api.CON.write(f"Could not save server history: {exc}")
+        finally:
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
     async def connect(self, spec, *, spawn_timeout=20):
         if self.connecting:
             return False
@@ -328,6 +389,7 @@ class ConsoleSession:
         except Exception as exc:
             q.CON.write(f"Connection failed: {exc}")
             return False
+        self._record_server(self.last_connect_spec)
         active.aliases = self.aliases
         self._attach_iplog(active)
         active._bind_cvar_subscriptions()

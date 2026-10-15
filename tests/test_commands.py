@@ -1,5 +1,7 @@
 import asyncio
+import io
 import json
+import os
 from pathlib import Path
 import tempfile
 import threading
@@ -51,6 +53,140 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         await self.execute("ready; observe; custom_mod_command arg")
         self.assertEqual(self.messages(), ["ready", "observe", "custom_mod_command arg"])
         self.assertEqual(self.cvars.get_value("cl_chatmode"), 0)
+
+    async def test_connect_completion_only_offers_saved_servers(self):
+        await self.execute('alias server_alias "ready"; seta server_cvar 1')
+        self.assertEqual(self.session._complete_input("connect ", ""), [])
+        self.session._record_server("denver.example:26000")
+        self.session._record_server("denver.example:26001")
+        self.session._record_server("other.example:26000")
+        for context in ("connect ", "CONNECT ", "echo test; connect "):
+            with self.subTest(context=context):
+                self.assertEqual(set(self.session._complete_input(context, "")),
+                                 {"denver.example:26000", "denver.example:26001", "other.example:26000"})
+                self.assertEqual(self.session._complete_input(context, "DEN"),
+                                 ["denver.example:26000", "denver.example:26001"])
+                self.assertEqual(self.session._complete_input(context, "missing"), [])
+        self.assertEqual(self.session._complete_input("connect denver.example:26000 ", ""), [])
+        self.assertIn("connect", self.session._complete_input("", "con"))
+        self.assertIn("server_cvar", self.session._complete_input("set ", "server"))
+
+        editor = self.session._terminal_input
+        editor.text = "connect oth"
+        editor.cursor = len(editor.text)
+        editor._complete()
+        self.assertEqual(editor.text, "connect other.example:26000 ")
+
+    async def test_readline_connect_completion_uses_current_command_and_history(self):
+        self.session._record_server("denver.example:26000")
+        for context in ("connect ", "echo test; connect ", "]connect "):
+            with self.subTest(context=context):
+                readline = mock.Mock(get_line_buffer=lambda: context + "den",
+                                     get_begidx=lambda: len(context))
+                with mock.patch.object(client, "_readline", readline):
+                    self.assertEqual(client._tab_completer("den", 0), "denver.example:26000")
+                    self.assertIsNone(client._tab_completer("den", 1))
+
+    async def test_completion_columns_follow_live_cvars_and_save_to_config(self):
+        await self.execute('alias alpha1 ready; alias alpha2 ready; alias alpha3 ready; '
+                           'alias alpha4 ready; alias alpha5 ready; alias alpha6 ready')
+        editor = self.session._terminal_input
+        editor._size = lambda: (80, 24)
+
+        def choices():
+            editor.text, editor.cursor = "alpha", 5
+            with mock.patch("sys.stdout", new_callable=io.StringIO) as output:
+                editor._complete()
+                return output.getvalue()
+
+        self.assertEqual(self.cvars.get_value("con_colmax"), 0)
+        self.assertEqual(self.cvars.get_value("con_coldirection"), 0)
+        await self.execute("con_colmax 2")
+        vertical = "  alpha1      alpha4\n  alpha2      alpha5\n  alpha3      alpha6\n"
+        self.assertEqual(choices(), vertical)
+        await self.execute("con_colmax 1")
+        self.assertEqual(choices(), "".join(f"  alpha{i}\n" for i in range(1, 7)))
+        await self.execute("con_colmax 2; con_coldirection 1")
+        horizontal = "  alpha1      alpha2\n  alpha3      alpha4\n  alpha5      alpha6\n"
+        self.assertEqual(choices(), horizontal)
+
+        readline = mock.Mock()
+        with mock.patch.object(client, "_readline", readline), \
+                mock.patch.object(client.shutil, "get_terminal_size", return_value=os.terminal_size((80, 24))), \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as output:
+            client._display_completion_matches("alpha", [f"alpha{i}" for i in range(1, 7)], 6)
+            self.assertEqual(output.getvalue(), "\n" + horizontal)
+        readline.redisplay.assert_called_once_with()
+        self.assertTrue(self.cvars.write_variables())
+        config = Path(self.cvars._config_file).read_text()
+        self.assertIn('con_colmax "2"\n', config)
+        self.assertIn('con_coldirection "1"\n', config)
+
+    async def test_connection_history_records_successes_and_survives_restart(self):
+        async def connect(host, port):
+            active = client.AsyncClient(FakeConnection())
+            active._spawned_fut.set_result(None)
+            return active
+
+        async def background(active):
+            await asyncio.Event().wait()
+
+        with mock.patch.object(client.AsyncClient, "connect", side_effect=connect), \
+                mock.patch.object(client, "_simple_keep_alive", background), \
+                mock.patch.object(client, "_watch_chatinfo", background), \
+                mock.patch.object(client, "_kickstart_handshake", background), \
+                mock.patch.object(client, "_connection_guard", background):
+            await self.execute("connect local; connect localhost:26001; connect LOCALHOST:26000")
+            path = self.directory / "servers.json"
+            entries = json.loads(path.read_text())
+            self.assertEqual([entry["address"] for entry in entries],
+                             ["LOCALHOST:26000", "localhost:26001"])
+            self.assertRegex(entries[0]["last_connected"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+            await self.session.close()
+            client._CONSOLE_SESSION = None
+            self.session = client._get_console_session()
+            self.dispatcher = self.session.dispatcher
+            self.assertEqual(self.session.last_connect_spec, "LOCALHOST:26000")
+            self.assertEqual(set(self.session._complete_input("connect ", "")),
+                             {"LOCALHOST:26000", "localhost:26001"})
+            await self.execute("connect last")
+            self.assertEqual(len(self.session.server_history), 2)
+
+        with mock.patch.object(client.AsyncClient, "connect", side_effect=OSError("unreachable")):
+            await self.execute("connect failed.example:26000; connect bad.example:0")
+        self.assertEqual(json.loads(path.read_text()), self.session.server_history)
+        self.assertEqual(self.session._complete_input("connect ", "failed"), [])
+
+    async def test_invalid_history_entries_are_not_completed(self):
+        path = self.directory / "servers.json"
+        path.write_text(json.dumps([None, {}, {"address": 12}, {"address": "bad;quit"},
+                                    {"address": "bad.example:0"}, {"address": "good.example"},
+                                    {"address": "GOOD.example:26000"}]))
+        self.session._load_server_history()
+        self.assertEqual(self.session._complete_input("connect ", ""), ["good.example:26000"])
+
+    async def test_unreadable_server_history_is_preserved(self):
+        path = self.directory / "servers.json"
+        for content in ('{"wrong": "shape"}', '["unterminated'):
+            with self.subTest(content=content):
+                path.write_text(content)
+                self.session._load_server_history()
+                self.session._record_server("good.example:26000")
+                self.assertEqual(path.read_text(), content)
+                self.assertEqual(self.session._complete_input("connect ", ""), ["good.example:26000"])
+        self.assertTrue(any("Could not read server history" in line for line in self.output()))
+
+    async def test_failed_history_write_preserves_previous_file_and_live_choices(self):
+        self.session._record_server("first.example:26000")
+        path = self.directory / "servers.json"
+        previous = path.read_bytes()
+        with mock.patch("pyquake.console.os.replace", side_effect=OSError("disk full")):
+            self.session._record_server("second.example:26000")
+        self.assertEqual(path.read_bytes(), previous)
+        self.assertEqual(set(self.session._complete_input("connect ", "")),
+                         {"first.example:26000", "second.example:26000"})
+        self.assertEqual(list(self.directory.glob(".servers-*")), [])
+        self.assertTrue(any("Could not save server history" in line for line in self.output()))
 
     async def test_demo_commands_save_named_file_and_can_record_again(self):
         path = self.directory / "match recording"

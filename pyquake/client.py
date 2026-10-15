@@ -62,6 +62,7 @@ if __package__:
     from .iplog import IpLog, StatusParser
     from .commands import define_alias, split_commands, quote_arg
     from .console import ConsoleSession, SERVER_COMMANDS, terminal_input_supported
+    from .terminal_input import format_completions
 else:
     from demo import Demo, recover_demo
     from downloads import DownloadError, DownloadManager, register_cvars as register_download_cvars
@@ -70,6 +71,7 @@ else:
     from iplog import IpLog, StatusParser
     from commands import define_alias, split_commands, quote_arg
     from console import ConsoleSession, SERVER_COMMANDS, terminal_input_supported
+    from terminal_input import format_completions
 from typing import Union
 
 # --- Windows UDP reliability: use SelectorEventLoop instead of Proactor ---
@@ -1362,8 +1364,14 @@ def _tabcomp_candidates(prefix: str, *, mode: str, first_token: str|None) -> lis
       - "root": first token completion -> commands ∪ cvars ∪ aliases
       - "cvar": second token completion for set/seta/toggle/reset/unset -> cvars
       - "alias": second token completion for alias/unalias/aliasedit -> aliases
+      - "connect": server addresses from saved connection history
     """
-    if mode == "cvar":
+    if mode == "none":
+        return []
+    if mode == "connect":
+        session = _get_console_session()
+        pool = [entry["address"] for entry in session.server_history]
+    elif mode == "cvar":
         pool = _tabcomp__all_cvar_names()
     elif mode == "alias":
         pool = _tabcomp__all_alias_names()
@@ -1393,6 +1401,8 @@ def _tabcomp_mode_for_line(tokens: list[str]) -> str:
     if not tokens:
         return "root"
     t0 = tokens[0].casefold()
+    if t0 == "connect":
+        return "connect" if len(tokens) == 1 else "none"
     if t0 in ("set", "seta", "toggle", "reset", "unset"):
         return "cvar"
     if t0 in ("alias", "unalias", "aliasedit"):
@@ -1413,19 +1423,18 @@ def _tab_completer(text: str, state: int):
       - first token: commands ∪ cvars ∪ aliases
       - 2nd token on set/seta/toggle/reset/unset: cvars
       - 2nd token on alias/unalias/aliasedit: alias names
+      - 2nd token on connect: saved server addresses
     """
     try:
         buf = _readline.get_line_buffer()
     except Exception:
         buf = ""
-    buf = _clean_prompt_lead(buf)
-
     # Compute the current tokens *up to* the cursor position.
     try:
         beg = _readline.get_begidx()
     except Exception:
         beg = len(buf) - len(text)
-    line_up_to_cursor = buf[:beg]
+    line_up_to_cursor = _clean_prompt_lead(buf[:beg]).rsplit(";", 1)[-1]
     # Split naively on whitespace (aliases are single bare names, fine)
     tokens = [t for t in re.split(r"\s+", line_up_to_cursor.strip()) if t]
     mode = _tabcomp_mode_for_line(tokens)
@@ -1442,6 +1451,15 @@ def _tab_completer(text: str, state: int):
         _TABCOMP_CACHE[key] = cand
     lst = _TABCOMP_CACHE.get(key, [])
     return lst[state] if 0 <= state < len(lst) else None
+
+def _display_completion_matches(substitution, matches, longest_match_length):
+    width = shutil.get_terminal_size().columns
+    sys.stdout.write("\n" + format_completions(
+        matches, width, cvar_system.get_value("con_colmax"),
+        cvar_system.get_value("con_coldirection")))
+    sys.stdout.flush()
+    _readline.redisplay()
+
 
 def _install_tab_completion() -> None:
     """
@@ -1469,6 +1487,10 @@ def _install_tab_completion() -> None:
         _readline.set_completer(_tab_completer)
     except Exception:
         pass
+    try:
+        _readline.set_completion_display_matches_hook(_display_completion_matches)
+    except (AttributeError, NotImplementedError):
+        pass  # Some readline/libedit builds do not expose a display hook.
 
 # Install tab completion early (safe to run multiple times)
 try:

@@ -72,9 +72,12 @@ connect last
 reconnect
 ```
 
-The interactive `connect` command uses `host[:port]`. The remembered server is
-available during the current session. Use `port 26001` to change the default port
-for subsequent connections without an explicit port.
+The interactive `connect` command uses `host[:port]`. Type `connect ` and press
+Tab to complete only previously connected server addresses; a partial address
+filters the choices. Successful connections are saved in `servers.json` beside
+`config.cfg`, with separate entries for different ports. `connect last` and
+`reconnect` can also use the most recent saved server after restarting.
+Use `port 26001` to change the default port for connections without an explicit port.
 
 For a password-protected server, set the password before connecting. Numeric and
 text passwords are supported:
@@ -127,6 +130,14 @@ incoming server messages. Use arrow keys to edit or recall history, Tab to
 complete commands, and Alt+Enter to insert a newline; Enter submits the input.
 Multiline bracketed pastes stay editable until submitted. Other terminals and
 redirected input use the standard readline/input prompt.
+
+Tab completion lists matches vertically, filling each column from top to bottom.
+Like QSS-M, fewer than six matches always use one column. The archived
+`con_colmax` setting controls the column count: `0` (default) fits the terminal
+width, `1` forces a single vertical list, and higher values cap the number of
+columns. Set `con_coldirection 1` to fill rows from left to right instead;
+`0` (default) fills columns vertically. These settings also apply to the readline
+prompt when its completion display hook is available.
 
 ### Choose your chat style
 
