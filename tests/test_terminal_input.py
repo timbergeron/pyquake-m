@@ -31,7 +31,8 @@ class LayoutTests(unittest.TestCase):
         self.assertIn("\x1b[48;2;30;30;30m", output)
         self.assertIn("\x1b[48;2;42;42;42m", output)
         self.assertIn("❯", output)
-        self.assertIn('Try "help"', output)
+        plain = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", output)
+        self.assertEqual(plain.split("\r\n")[1], "  ❯" + " " * 29)
         self.assertEqual(editor.drawn, 3)
         editor.text, editor.cursor = "x" * 1000, 1000
         editor._erase()

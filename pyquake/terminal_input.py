@@ -13,9 +13,7 @@ RESET = "\x1b[0m"
 BACKGROUND = "\x1b[48;2;30;30;30m"
 HIGHLIGHT = "\x1b[48;2;42;42;42m"
 WHITE = "\x1b[97m"
-MUTED = "\x1b[38;2;128;128;128m"
 BORDER = "\x1b[38;2;78;78;78m"
-PLACEHOLDER = 'Try "help" or "say hello"'
 
 
 def supported():
@@ -130,13 +128,9 @@ class TerminalInput:
         lines = [rule]
         for index, row in enumerate(visible, first):
             content = row
-            color = WHITE
-            if not self.text and index == 0:
-                content = PLACEHOLDER[:width - 6]
-                color = MUTED
             padding = width - 4 - sum(cell_width(c) for c in content)
             lead = "  " + WHITE + "❯" if index == 0 else "   "
-            lines.append(BACKGROUND + lead + HIGHLIGHT + " " + color + content
+            lines.append(BACKGROUND + lead + HIGHLIGHT + " " + WHITE + content
                          + " " * max(0, padding - 2) + BACKGROUND + "  " + RESET)
         lines.append(rule)
         self.output.write("\x1b[?25l" + "\r\n".join(lines))
