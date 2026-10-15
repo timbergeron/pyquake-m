@@ -1,6 +1,7 @@
 """Console commands and connection lifecycle shared by every command source."""
 
 import asyncio
+import ctypes
 import fnmatch
 import inspect
 import os
@@ -523,7 +524,18 @@ class ConsoleSession:
         prefill = (int(self.cvars.get_value("cl_chatmode")) in (2, 3)
                    and q._readline is not None and not q._EDIT_PREFILL)
         if prefill:
-            q._readline.set_startup_hook(lambda: q._readline.insert_text(" "))
+            if q._rl_is_libedit():
+                # libedit clears its edit buffer after the startup hook.
+                # Queue a space as input so it survives that reset and remains
+                # editable, rather than adding padding to the prompt.
+                library = ctypes.CDLL(q._readline.__file__)
+                insert = library.rl_insert
+                insert.argtypes = (ctypes.c_int, ctypes.c_int)
+                insert.restype = ctypes.c_int
+                hook = lambda: insert(1, ord(" "))
+            else:
+                hook = lambda: q._readline.insert_text(" ")
+            q._readline.set_startup_hook(hook)
         try:
             return input(prompt)
         finally:

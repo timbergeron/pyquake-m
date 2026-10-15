@@ -449,6 +449,51 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
             self.session.read_line("> ")
         readline.set_startup_hook.assert_not_called()
 
+    async def test_chatmode_space_is_part_of_the_editable_input(self):
+        readline = mock.Mock()
+
+        def read_input(prompt):
+            self.assertEqual(prompt, "> ")
+            readline.set_startup_hook.call_args.args[0]()
+            readline.insert_text.assert_called_once_with(" ")
+            return " ready"
+
+        for mode in (2, 3):
+            with self.subTest(mode=mode):
+                self.cvars.set("cl_chatmode", str(mode))
+                readline.reset_mock()
+                with mock.patch.object(client, "_readline", readline), \
+                        mock.patch.object(client, "_rl_is_libedit", return_value=False), \
+                        mock.patch("builtins.input", side_effect=read_input):
+                    await self.execute(self.session.read_line("> "))
+                readline.set_startup_hook.assert_called_with(None)
+        self.assertEqual(self.messages(), ['say "ready"', 'say "ready"'])
+
+    async def test_libedit_queues_space_past_its_buffer_reset(self):
+        readline = mock.Mock(__file__="readline.so")
+        library = mock.Mock()
+
+        def read_input(prompt):
+            readline.set_startup_hook.call_args.args[0]()
+            # Direct buffer insertion is discarded when libedit starts reading.
+            readline.insert_text.assert_not_called()
+            library.rl_insert.assert_called_once_with(1, ord(" "))
+            return " ready"
+
+        for mode in (2, 3):
+            with self.subTest(mode=mode):
+                self.cvars.set("cl_chatmode", str(mode))
+                readline.reset_mock()
+                library.reset_mock()
+                with mock.patch.object(client, "_readline", readline), \
+                        mock.patch.object(client, "_rl_is_libedit", return_value=True), \
+                        mock.patch("pyquake.console.ctypes.CDLL", return_value=library) as load, \
+                        mock.patch("builtins.input", side_effect=read_input):
+                    await self.execute(self.session.read_line("> "))
+                load.assert_called_once_with("readline.so")
+                readline.set_startup_hook.assert_called_with(None)
+        self.assertEqual(self.messages(), ['say "ready"', 'say "ready"'])
+
     async def test_queued_reconnect_switches_clients_and_preserves_aliases(self):
         self.session.last_connect_spec = "localhost:26001"
         await self.execute('alias go "ready"')
