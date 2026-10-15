@@ -1,21 +1,25 @@
 """Console commands and connection lifecycle shared by every command source."""
 
 import asyncio
+import fnmatch
 import inspect
+from pathlib import Path
 import re
 import shlex
 import time
 
 if __package__:
     from .commands import CommandDispatcher, alias_key, define_alias, quote_arg, split_commands
+    from .iplog import IpLog, address_prefix, format_address
 else:
     from commands import CommandDispatcher, alias_key, define_alias, quote_arg, split_commands
+    from iplog import IpLog, address_prefix, format_address
 
 
 SERVER_COMMANDS = frozenset({
     "status", "players", "kill", "ping", "pings", "impulse", "say", "say_team",
     "ready", "unready", "notready", "observe", "observer", "spectate", "join",
-    "team", "vote", "yes", "no", "pause", "identify", "setinfo", "serverinfo",
+    "team", "vote", "yes", "no", "pause", "setinfo", "serverinfo",
 })
 
 
@@ -29,6 +33,13 @@ class ConsoleSession:
         self.demo = None
         self.enable_demo = False
         self.connecting = False
+        self.iplog = IpLog(Path(self.cvars._config_file).expanduser().resolve().parent / "iplog.dat")
+        try:
+            self.iplog.load()
+        except (OSError, ValueError) as exc:
+            api.CON.write(f"Could not read IP history: {exc}")
+        if self.client is not None:
+            self._attach_iplog(self.client)
         for name, value, kind, description in (
             ("cl_chatmode", "0", api.CvarType.INT, "0=commands, 1=auto chat, 2=chat-first (prefilled space), 3=leading-space chat"),
             ("cfg_save_aliases", "1", api.CvarType.BOOL, "Save command aliases in config.cfg"),
@@ -110,6 +121,7 @@ class ConsoleSession:
             q.CON.write(f"Connection failed: {exc}")
             return False
         active.aliases = self.aliases
+        self._attach_iplog(active)
         active._bind_cvar_subscriptions()
         q._set_current_client(active)
         if self.enable_demo and self.demo is None:
@@ -191,6 +203,8 @@ class ConsoleSession:
                 q.CON.write("usage: condump [filename]")
             else:
                 q.CON.dump(args[0] if args else "condump.txt")
+        elif name in ("identify", "ipdump", "ipmerge", "ipnames"):
+            await self._identity_command(name, args)
         elif name == "demo":
             if self.demo is not None:
                 q.CON.write("Demo already recording")
@@ -252,6 +266,115 @@ class ConsoleSession:
         else:
             return False
         return True
+
+    def _attach_iplog(self, active):
+        for address, name in active.iplog.entries():
+            self.iplog.add(address, name)
+        active.iplog = self.iplog
+
+    def _iplog_printable(self, name):
+        text = self.api._strip_quake_colors(name, colorize_masked_red=False, strip_ansi_codes=True)
+        return re.sub(r"[\x00-\x1f\x7f]", " ", text).strip()
+
+    def _show_identity(self, address, label):
+        q = self.api
+        q.CON.write(f"known aliases for {label}:")
+        names = self.iplog.aliases(address)
+        for name in names:
+            q.CON.write(self._iplog_printable(name))
+        q.CON.write(f"{len(names)} {'entry' if len(names) == 1 else 'entries'} found")
+
+    async def _identity_command(self, command, args):
+        q = self.api
+        if command == "identify":
+            await self._identify(" ".join(args).strip())
+            return
+        if ((command == "ipmerge" and len(args) != 1)
+                or (command == "ipdump" and len(args) > 1)
+                or (command == "ipnames" and args)):
+            q.CON.write({"ipmerge": "usage: ipmerge <filename>",
+                         "ipdump": "usage: ipdump [filename]", "ipnames": "usage: ipnames"}[command])
+            return
+        try:
+            if command == "ipmerge":
+                count = self.iplog.merge(Path(args[0]).expanduser())
+                self.iplog.save()
+                q.CON.write(f"Merged {args[0]} ({count} new entries)")
+            elif command == "ipdump":
+                path = Path(args[0]).expanduser() if args else self.iplog.path.with_suffix(".txt")
+                self.iplog.dump(path, self._iplog_printable)
+                q.CON.write(f"Wrote {path}")
+            else:
+                names = self.iplog.names()
+                if not names:
+                    q.CON.write("No IP log entries found")
+                    return
+                q.CON.write("IP log names:")
+                for name in names:
+                    q.CON.write(self._iplog_printable(name))
+                q.CON.write(f"{len(names)} {'entry' if len(names) == 1 else 'entries'} found")
+        except (OSError, ValueError) as exc:
+            q.CON.write(f"{command}: {exc}")
+
+    def _identity_players(self, active):
+        players = {slot: row.get("name_full") or row.get("name", "")
+                   for slot, row in active._score_state.items() if row.get("active")}
+        for slot, record in active._status_players.items():
+            if slot not in active._score_state:
+                players[slot] = record.name
+        return players
+
+    def _identity_slot(self, active, target):
+        players = self._identity_players(active)
+        if not target:
+            slot = active._last_connected_slot
+            if slot is None and players:
+                slot = next(reversed(players))
+            return slot if slot in players else None, False
+        if re.fullmatch(r"#?\d+", target):
+            slot = int(target.lstrip("#")) - 1
+            return slot if slot in players else None, False
+
+        def key(text):
+            text = self.api._sanitize_player_name_full(text).casefold()
+            return text.translate(str.maketrans("01234567", "olzeasbt"))
+
+        needle = key(target)
+        exact = [slot for slot, name in players.items() if key(name) == needle]
+        matches = exact or [slot for slot, name in players.items()
+                            if needle in key(name) or fnmatch.fnmatchcase(key(name), needle)]
+        return (matches[0] if len(matches) == 1 else None), len(matches) > 1
+
+    async def _identify(self, target):
+        q = self.api
+        address = address_prefix(target)
+        if address is not None:
+            self._show_identity(address, format_address(address))
+            return
+        active = self.client
+        if active is None or active.disconnected:
+            q.CON.write("Not connected. Use identify <ip prefix> to search saved history.")
+            return
+        slot, ambiguous = self._identity_slot(active, target)
+        if ambiguous:
+            q.CON.write("No unique player match for that name")
+            return
+        if slot is None or slot not in active._status_players:
+            if not await active.refresh_status():
+                q.CON.write("Could not read player IP information from status")
+                return
+            slot, ambiguous = self._identity_slot(active, target)
+        if ambiguous:
+            q.CON.write("No unique player match for that name")
+            return
+        if slot is None:
+            q.CON.write("No such player" if target else "No last connected player found")
+            return
+        record = active._status_players.get(slot)
+        if record is None or record.address is None:
+            q.CON.write("No IPv4 information for that player")
+            return
+        self._show_identity(record.address, self._iplog_printable(record.name))
 
     def _cvar_command(self, command, args):
         q = self.api
@@ -344,6 +467,10 @@ class ConsoleSession:
         q = self.api
         await self.dispatcher.close()
         await self.disconnect()
+        try:
+            self.iplog.save()
+        except (OSError, ValueError) as exc:
+            q.CON.write(f"Could not save IP history: {exc}")
         await q._stop_tasks(q._IDLE_RECONNECT._task)
         if self.demo is not None:
             self.demo.stop_recording()

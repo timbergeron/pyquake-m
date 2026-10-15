@@ -57,11 +57,13 @@ from threading import Event
 
 if __package__:
     from . import aiodgram, proto
+    from .iplog import IpLog, StatusParser
     from .commands import define_alias, split_commands, quote_arg
     from .console import ConsoleSession, SERVER_COMMANDS
 else:
     import aiodgram
     import proto
+    from iplog import IpLog, StatusParser
     from commands import define_alias, split_commands, quote_arg
     from console import ConsoleSession, SERVER_COMMANDS
 from typing import Union
@@ -1284,6 +1286,7 @@ _RESERVED_CMDS = frozenset({
     "say_random5","say_random6","say_random7","say_random8","say_random9",
     # new local commands (reserve so server can't shadow them)
     "find","apropos","aliasedit",
+    "identify","ipdump","ipmerge","ipnames",
     # temp local debug command so servers can't shadow it
     "infotest",
     # cvar-related builtins
@@ -2230,6 +2233,10 @@ def _print_cmdlist():
     print("  demo                - Start demo recording")
     print("  kill                - Suicide")
     print("  status              - Show server status")
+    print("  identify [WHO|IP]   - Show locally known player aliases (slots start at 1)")
+    print("  ipdump [file]       - Export identity history (default iplog.txt)")
+    print("  ipmerge <file>      - Import a ProQuake/QSS-M iplog.dat file")
+    print("  ipnames             - List unique names in local identity history")
     print("  players             - Show player list")
     print("  showscores          - Show live scoreboard with pings/frags")
     print("  ping                - Send ping to server")
@@ -3113,6 +3120,12 @@ class AsyncClient:
         self._score_state: dict[int, dict] = {}
         # name -> latest parsed ping from 'ping' command
         self._latest_ping_by_name: dict[str, int] = {}
+        self.iplog = IpLog()  # ConsoleSession supplies the persistent shared store.
+        self._status_parser = StatusParser()
+        self._status_players = {}
+        self._last_connected_slot: int | None = None
+        self._status_waiter = None
+        self._status_lock = asyncio.Lock()
 
         # --- Internal capture for silent 'ping' sweep used by showscores ---
         self._suppress_prints: bool = False
@@ -3315,6 +3328,47 @@ class AsyncClient:
         self._demos.append(d)
         d.start_recording()
         return d
+
+    def _finish_status(self, success: bool) -> None:
+        if self._status_waiter is not None and not self._status_waiter.done():
+            self._status_waiter.set_result(success)
+
+    def _read_status_print(self, text: str) -> None:
+        if text.startswith("\x01"):  # Marked chat cannot supply status records.
+            return
+        clean = _strip_quake_colors(text, colorize_masked_red=False, strip_ansi_codes=True)
+        for players in self._status_parser.feed(clean):
+            self._status_players = {
+                slot: player for slot, player in players.items()
+                if slot not in self._score_state or (
+                    self._score_state[slot].get("active")
+                    and _name_key(self._score_state[slot].get("name", "")) == _name_key(player.name))
+            }
+            for player in players.values():
+                if player.address is not None:
+                    self.iplog.add(player.address, player.name)
+            try:
+                self.iplog.save()
+            except (OSError, ValueError) as exc:
+                logger.warning("Could not save IP history: %s", exc)
+            self._finish_status(True)
+
+    async def refresh_status(self, timeout: float = 1.5) -> bool:
+        """Request a complete status reply without suppressing server prints."""
+        async with self._status_lock:
+            if self.disconnected:
+                return False
+            self._status_parser.reset()
+            self._status_waiter = asyncio.get_running_loop().create_future()
+            try:
+                await self.send_command("status")
+                return await asyncio.wait_for(asyncio.shield(self._status_waiter), timeout)
+            except asyncio.TimeoutError:
+                return False
+            finally:
+                if not self._status_waiter.done():
+                    self._status_waiter.cancel()
+                self._status_waiter = None
 
     def _mono_now(self):
         return time.monotonic() - self._mono0
@@ -3797,6 +3851,7 @@ class AsyncClient:
 
                 # Human-visible server text (console lines, chat, kills, etc.)
                 if parsed.msg_type == proto.ServerMessageType.PRINT:
+                    self._read_status_print(parsed.string)
                     clean = _strip_quake_colors(parsed.string).strip()
                     DBG_ONCE("print", f"PRINT: {clean[:90]!r}")
                     # Capture last chat message for 'like' command (team-aware)
@@ -3894,6 +3949,10 @@ class AsyncClient:
                     self._userinfo_is.clear()
                     self._synthetic_userinfo.clear()
                     self._latest_ping_by_name.clear()
+                    self._status_players.clear()
+                    self._status_parser.reset()
+                    self._last_connected_slot = None
+                    self._finish_status(False)
                     self._pq_reset_teams()
                     self._pq_teamgame_hint = False
                     self._pq_minutes = self._pq_seconds = self._pq_last_time_seen = None
@@ -3951,6 +4010,10 @@ class AsyncClient:
                             row = self._score_state.setdefault(int(i), {})
                             nm_full = _sanitize_player_name_full(nm_raw)
                             nm_short = nm_full[:15]  # Empty names mark unused slots.
+                            if not nm_short or row.get("name") != nm_short:
+                                self._status_players.pop(int(i), None)
+                            if nm_short and not row.get("active"):
+                                self._last_connected_slot = int(i)
                             if nm_short:
                                 if row.get("name") != nm_short:
                                     self._latest_ping_by_name.pop(row.get("name", ""), None)
@@ -4208,6 +4271,7 @@ class AsyncClient:
             logger.warning("Connection closed: %s", exc)
         self.disconnected = True
         self._alive = False
+        self._finish_status(False)
         for future in (self._spawned_fut, self._updated_fut, self._center_print_fut):
             if not future.done():
                 future.cancel()
@@ -4302,6 +4366,7 @@ class AsyncClient:
     async def disconnect(self):
         self.disconnected = True
         self._alive = False
+        self._finish_status(False)
         if self._read_task is not None:
             self._read_task.cancel()
             await asyncio.gather(self._read_task, return_exceptions=True)

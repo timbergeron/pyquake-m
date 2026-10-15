@@ -2,3 +2,7 @@
 *.sw[opnm]
 __pycache__/
 *.py[cod]
+
+# Local player identity history
+iplog.dat
+iplog.txt
