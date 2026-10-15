@@ -157,6 +157,7 @@ class DatagramConnection:
         self._message_queue = asyncio.Queue()
 
         self._unreliable_send_seq = 0
+        self.last_message_sequence = None
         self._tasks = ()
         self._closing = False
         self._closed_exc = None
@@ -447,7 +448,7 @@ class DatagramConnection:
                         logger.warning("Skipped %s unreliable messages",
                                        skipped)
                     unreliable_recv_seq = (seq_num + 1) & 0xffffffff
-                    await self._message_queue.put(body)
+                    await self._message_queue.put((body, seq_num))
             elif _NetFlags.ACK in netflags:
                 await self._send_reliable_ack_queue.put(seq_num)
             elif _NetFlags.DATA in netflags:
@@ -460,7 +461,7 @@ class DatagramConnection:
                     recv_seq = (recv_seq + 1) & 0xffffffff
 
                 if _NetFlags.EOM in netflags:
-                    await self._message_queue.put(reliable_msg)
+                    await self._message_queue.put((reliable_msg, None))
                     reliable_msg = b''
 
     async def read_message(self):
@@ -469,6 +470,7 @@ class DatagramConnection:
         if message is None:
             self._message_queue.put_nowait(None)
             raise self._closed_exc
+        message, self.last_message_sequence = message
         return message
 
     def disconnect(self):

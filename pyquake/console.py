@@ -297,7 +297,7 @@ class ConsoleSession:
             if args and args[0].lower() == "protocols":
                 command = "protocols 999 666 15"
             elif args and args[0].lower() == "pext":
-                command = "pext 0 0 0 0"
+                command = q.proto.pext_command()
             if command:
                 await self.forward(command)
             else:

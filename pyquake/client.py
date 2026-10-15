@@ -1856,21 +1856,28 @@ def _on_color_changed(_cvar, _old, _new):
 
 
 def _make_move_body(pitch, yaw, roll, forward, side, up, buttons, impulse,
-                    high_res_inputs=False, cmd_time=None):
+                    high_res_inputs=False, cmd_time=None, *, input_sequence=None,
+                    protocol_flags=0):
     # Use server time if available, else a monotonic fallback
     if cmd_time is None:
         cmd_time = 0.0
-    if not high_res_inputs:
+    if protocol_flags & proto.ProtocolFlags.FLOATANGLE:
+        fmt = '<Bf' + 'fff' + 'hhhBB'
+        encode_func = lambda angle: math.degrees(angle)
+    elif not high_res_inputs and not protocol_flags & proto.ProtocolFlags.SHORTANGLE:
         fmt = "<BfBBBhhhBB"
         encode_func = _encode_angle
     else:
         fmt = "<BfHHHhhhBB"
         encode_func = _encode_angle_16
 
-    return struct.pack(fmt,
+    body = struct.pack(fmt,
                        3, float(cmd_time),
                        encode_func(pitch), encode_func(yaw), encode_func(roll),
                        int(forward), int(side), int(up), int(buttons), int(impulse))
+    if input_sequence is not None:
+        body = body[:1] + struct.pack('<H', input_sequence & 0xffff) + body[1:]
+    return body
 
 
 def _patch(old_val, new_val):
@@ -3118,15 +3125,21 @@ class AsyncClient:
         self._updated_fut = asyncio.Future()
         self.entities = {}
         self.baselines = {}
+        self._fte_entities = {}
+        self._fte_baselines = {}
+        self.stats = {}
+        self.stat_strings = {}
+        self._move_sequence = 0
+        self.input_ack = None
+        self.gamedir = ''
+        self.sounds = None
         self.angles = (0., 0., 0.)
         self.velocity = (0., 0., 0.)
         self.on_ground = None
         self.view_height = None
         self.models = None
         self.disconnected = False
-        # --- Protocol extension tracking (server-advertised) ---
-        # FTE/QSS-style pext comes as four 32-bit fields: pext[0..3].
-        # REPLACEMENTDELTAS lives in pext[2] (aka "pext2" in many engines).
+        # Protocol-ID/mask pairs, populated from negotiated serverinfo headers.
         self._pext_bits: list[int] = [0, 0, 0, 0]
         self._saw_cmd_pext: bool = False
 
@@ -3355,6 +3368,17 @@ class AsyncClient:
             d.add_message(self.angles, message, index == 0)
         for message in self._demo_state.values():
             d.add_message(self.angles, message, False)
+        if self.protocol.pext2 & proto.PEXT2_REPLACEMENTDELTAS and self.time is not None:
+            header = b'\x56'
+            if self.protocol.pext2 & proto.PEXT2_PREDINFO:
+                header += struct.pack('<H', self.input_ack or 0)
+            header += struct.pack('<f', self.time)
+            # One complete entity per message keeps large snapshots bounded by
+            # the demo/network message limit. The first message resets the world.
+            d.add_message(self.angles, header + b'\x00\x80\x00\x00', False)
+            for number, state in self._fte_entities.items():
+                d.add_message(self.angles, header + proto.encode_fte_entity_number(number)
+                              + proto.encode_fte_delta(state, self.protocol) + b'\0\0', False)
         self._demos.append(d)
         return d
 
@@ -3411,14 +3435,26 @@ class AsyncClient:
             proto.ServerMessageType.UPDATECOLORS: "client_num",
             proto.ServerMessageType.LIGHTSTYLE: "index",
             proto.ServerMessageType.UPDATESTAT: "index",
+            proto.ServerMessageType.UPDATESTATBYTE: "index",
+            proto.ServerMessageType.UPDATESTATFLOAT: "index",
+            proto.ServerMessageType.UPDATESTATSTRING: "index",
+            proto.ServerMessageType.PRECACHE: "index",
         }
         if kind in indexed:
-            key = (kind, getattr(parsed, indexed[kind]))
+            stat_kind = proto.ServerMessageType.UPDATESTAT if kind in (
+                proto.ServerMessageType.UPDATESTATBYTE, proto.ServerMessageType.UPDATESTATFLOAT) else kind
+            key = (stat_kind, getattr(parsed, indexed[kind]))
         elif kind in (proto.ServerMessageType.TIME, proto.ServerMessageType.SETVIEW,
                       proto.ServerMessageType.SETANGLE, proto.ServerMessageType.SETPAUSE,
                       proto.ServerMessageType.CDTRACK, proto.ServerMessageType.CLIENTDATA,
                       proto.ServerMessageType.SKYBOX, proto.ServerMessageType.FOG):
             key = (kind, None)
+        elif self._demo_signon_complete and kind in (
+                proto.ServerMessageType.SPAWNSTATIC, proto.ServerMessageType.SPAWNSTATIC2,
+                proto.ServerMessageType.FTE_SPAWNSTATIC, proto.ServerMessageType.SPAWNSTATICSOUND,
+                proto.ServerMessageType.SPAWNSTATICSOUND2, proto.ServerMessageType.DP_SPAWNSTATICSOUND):
+            # Statics persist for the map, including ones created after sign-on.
+            key = (kind, len(self._demo_state))
         else:
             return
         self._demo_state[key] = raw
@@ -3712,7 +3748,7 @@ class AsyncClient:
         except Exception:
             p = y = r = 0.0
         # 1 unit forward, no buttons/impulse; this is UNRELIABLE.
-        payload = _make_move_body(
+        payload = self._make_move_body(
             p, y, r, 1, 0, 0, 0, 0,
             self.high_res_inputs,
             self.time if self.time is not None else self._mono_now()
@@ -3725,7 +3761,7 @@ class AsyncClient:
             p, y, r = self.angles
         except Exception:
             p = y = r = 0.0
-        payload = _make_move_body(
+        payload = self._make_move_body(
             p, y, r, 1, 0, 0, 0, 0,
             self.high_res_inputs,
             self.time if self.time is not None else self._mono_now()
@@ -3737,6 +3773,8 @@ class AsyncClient:
 
         while True:
             remaining_msg = msg = wire_msg = await self._conn.read_message()
+            frame_sequence = getattr(self._conn, 'last_message_sequence', None)
+            has_fte_update = False
             # Count inbound packet/frame + bytes
             try:
                 self._net_stats["packets_received"] += 1
@@ -3773,8 +3811,6 @@ class AsyncClient:
                     self._signon_seen = True
                 if parsed.msg_type == proto.ServerMessageType.STUFFTEXT:
                     DBG_ONCE("stufftext", f"STUFFTEXT: {parsed.string.strip()[:90]!r}")
-                    if parsed.string.strip() == "cmd pext":
-                        DBG("pext negotiation requested by server; replying with zeros")
                     # PQ binary prefixes can be followed by ordinary stufftext.
                     parsed.string = self._handle_proquake_stufftext(parsed.string)
                     if not parsed.string:
@@ -3784,33 +3820,7 @@ class AsyncClient:
                     if parsed.string.strip() == "cmd pext":
                         # Server is negotiating FTE/QSS extensions.
                         self._saw_cmd_pext = True
-                        # Full 4-field reply expected by FTE/QSS: pext <bits0> <bits1> <bits2> <bits3>
-                        # Use plain decimals (some servers don't accept hex tokens).
-                        await self.send_reliable_raw(_make_cmd_body("pext 0 0 0 0\n"))
-                    else:
-                        # Capture any server-advertised pext bitfields.
-                        # Accept lines like:
-                        #   "pext a b c d"
-                        #   "cmd pext a b c d"
-                        # Accept decimal or 0x... hex.
-                        try:
-                            for _line in parsed.string.splitlines():
-                                s = _line.strip()
-                                m = re.match(r"^(?:cmd\s+)?pext\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s*$",
-                                             s, flags=re.IGNORECASE)
-                                if not m:
-                                    continue
-                                vals = []
-                                for t in m.groups():
-                                    try:
-                                        vals.append(int(t, 0))
-                                    except Exception:
-                                        vals.append(0)
-                                if len(vals) == 4:
-                                    self._pext_bits = vals
-                                    DBG_ONCE("pext-captured", f"pext captured {self._pext_bits}")
-                        except Exception:
-                            pass
+                        await self.send_reliable_raw(_make_cmd_body(proto.pext_command() + '\n'))
                     # Handle ping requests to prevent lag detection
                     if parsed.string.strip() == "cmd ping":
                         await self.send_reliable_raw(_make_cmd_body("ping"))
@@ -4004,6 +4014,17 @@ class AsyncClient:
                     self.time = None
                     self.entities.clear()
                     self.baselines.clear()
+                    self._fte_entities.clear()
+                    self._fte_baselines.clear()
+                    self.stats.clear()
+                    self.stat_strings.clear()
+                    self._move_sequence = 0
+                    self.input_ack = None
+                    self.velocity = (0., 0., 0.)
+                    self.on_ground = None
+                    self.view_height = None
+                    self.gamedir = parsed.gamedir
+                    self.sounds = parsed.sounds
                     self._userinfo_is.clear()
                     self._synthetic_userinfo.clear()
                     self._latest_ping_by_name.clear()
@@ -4023,30 +4044,12 @@ class AsyncClient:
                     has_server_info = True
 
                     if parsed.protocol != self.protocol:
-                        # Friendly banner using real PEXT2 flag when available
-                        def _proto_number(p: "proto.Protocol") -> int | None:
-                            v = getattr(p, "version", p)
-                            try:
-                                return int(getattr(v, "value", v))
-                            except Exception:
-                                return None
-                        def _protocol_banner(p: "proto.Protocol") -> str:
-                            n = _proto_number(p)
-                            if n is None:
-                                return "unknown"
-                            pext2_mask = getattr(proto, "PEXT2_REPLACEMENTDELTAS", 0)
-                            # Prefer a real field on the protocol object if it's ever plumbed:
-                            pext2_val = getattr(p, "pext2", None)
-                            if pext2_val is None:
-                                # Fall back to server-advertised pext[2] captured from STUFFTEXT.
-                                pext2_val = self._pext_bits[2]
-                            has_rdelta = bool(int(pext2_val) & int(pext2_mask))
-                            # Heuristic: if server asked for 'cmd pext' and we're on 666, prefer "fte666".
-                            if not has_rdelta and n == 666 and self._saw_cmd_pext:
-                                return f"fte{n}"
-                            return f"fte{n}" if has_rdelta else f"{n}"
-                        CON.write(f"Using protocol {_protocol_banner(parsed.protocol)}")
+                        CON.write(f"Using protocol {parsed.protocol.name}")
                     self.protocol = parsed.protocol
+                    self._pext_bits = [proto.PROTOCOL_FTE_PEXT1, self.protocol.pext1,
+                                       proto.PROTOCOL_FTE_PEXT2, self.protocol.pext2]
+                    if self.protocol.pext2 & proto.PEXT2_REPLACEMENTDELTAS:
+                        await self._send_unreliable(b'\x32\xff\xff\xff\xff')
 
                     # New level/serverinfo → clear scoreboard state (prevents ghosts)
                     try:
@@ -4246,6 +4249,56 @@ class AsyncClient:
                     self.on_ground = parsed.on_ground
                     self.view_height = parsed.view_height
                     has_client_update = True
+                    for index, name in ((0, 'health'), (2, 'weapon_model_index'), (3, 'ammo'),
+                                        (4, 'armor'), (5, 'weapon_frame'), (6, 'shells'),
+                                        (7, 'nails'), (8, 'rockets'), (9, 'cells'),
+                                        (10, 'active_weapon'), (15, 'items'), (16, 'view_height')):
+                        value = getattr(parsed, name, None)
+                        if value is not None:
+                            self.stats[index] = value
+
+                if parsed.msg_type in (proto.ServerMessageType.UPDATESTAT,
+                                       proto.ServerMessageType.UPDATESTATBYTE,
+                                       proto.ServerMessageType.UPDATESTATFLOAT):
+                    self.stats[parsed.index] = parsed.value
+                if parsed.msg_type == proto.ServerMessageType.UPDATESTATSTRING:
+                    self.stat_strings[parsed.index] = parsed.value
+                if parsed.msg_type == proto.ServerMessageType.PRECACHE:
+                    category, index = parsed.index & 0xc000, parsed.index & 0x3fff
+                    table = self.models if category == 0 else self.sounds if category == 0x8000 else None
+                    if table is not None and index:
+                        while len(table) < index:
+                            table.append('')
+                        table[index - 1] = parsed.name
+
+                if parsed.msg_type == proto.ServerMessageType.FTE_SPAWNBASELINE:
+                    state = proto.merge_fte_delta(None, None, parsed.delta)
+                    self._fte_baselines[parsed.entity_num] = state
+                    self.baselines[parsed.entity_num] = self._fte_entity(parsed.entity_num, state)
+
+                if parsed.msg_type == proto.ServerMessageType.UPDATEENTITIES:
+                    has_fte_update = has_client_update = True
+                    self.time = parsed.time
+                    self.input_ack = parsed.input_ack
+                    for number, delta in parsed.updates:
+                        if delta is None:
+                            if number == 0:
+                                self._fte_entities.clear()
+                                self.entities.clear()
+                            else:
+                                self._fte_entities.pop(number, None)
+                                self.entities.pop(number, None)
+                        else:
+                            state = proto.merge_fte_delta(self._fte_entities.get(number),
+                                                         self._fte_baselines.get(number), delta)
+                            self._fte_entities[number] = state
+                            self.entities[number] = self._fte_entity(number, state)
+                    if self.protocol.pext2 & proto.PEXT2_PREDINFO:
+                        view = self._fte_entities.get(self.view_entity)
+                        if view is not None:
+                            self.velocity = view.values.get('velocity', (0., 0., 0.))
+                            self.on_ground = bool(view.values.get('eflags', 0) & 128)
+                        self.view_height = self.stats.get(16, 0)
 
                 # Update entity positions
                 if parsed.msg_type in (proto.ServerMessageType.SPAWNBASELINE,
@@ -4281,6 +4334,7 @@ class AsyncClient:
 
                 if parsed.msg_type == proto.ServerMessageType.TIME:
                     self.time = parsed.time
+                    self.input_ack = parsed.input_ack
 
                 if parsed.msg_type == proto.ServerMessageType.INTERMISSION:
                     self.level_finished = True
@@ -4300,9 +4354,13 @@ class AsyncClient:
                     break
 
             if has_client_update:
-                self.entities = next_entities
+                if not self.protocol.pext2 & proto.PEXT2_REPLACEMENTDELTAS:
+                    self.entities = next_entities
                 self._updated_fut.set_result(None)
                 self._updated_fut = asyncio.Future()
+            if has_fte_update and frame_sequence is not None and not self.disconnected:
+                # Acknowledge only after the complete packet has parsed successfully.
+                await self._send_unreliable(b'\x32' + struct.pack('<I', frame_sequence))
 
             # Synthesize userinfo from scoreboard when real userinfo is missing
             try:
@@ -4379,7 +4437,7 @@ class AsyncClient:
             impulse = 0
         # NOTE: fire-and-forget; framed by transport or promoted to reliable via wrapper
         asyncio.create_task(self._send_unreliable(
-            _make_move_body(pitch, yaw, roll,
+            self._make_move_body(pitch, yaw, roll,
                             forward, side, up, buttons, int(impulse),
                             self.high_res_inputs, cmd_time)))
 
@@ -4463,7 +4521,26 @@ class AsyncClient:
         return (
             getattr(self._conn, "proquake_angle_hack", False)
             or self.protocol.version != proto.ProtocolVersion.NETQUAKE
+            or bool(self.protocol.pext2 & proto.PEXT2_PREDINFO)
         )
+
+    def _make_move_body(self, *args):
+        sequence = None
+        if self.protocol.pext2 & proto.PEXT2_PREDINFO:
+            sequence = self._move_sequence
+            self._move_sequence += 1
+        return _make_move_body(*args, input_sequence=sequence,
+                               protocol_flags=self.protocol.flags)
+
+    @staticmethod
+    def _fte_entity(number, state):
+        values = state.values
+        x, y = values.get('originxy', (0., 0.))
+        pitch, roll = values.get('anglesxz', (0., 0.))
+        return Entity(number, values.get('model_num', 0), values.get('frame', 0),
+                      values.get('colormap', 0), values.get('skin', 0),
+                      (x, y, values.get('originz', 0.)),
+                      (pitch, values.get('anglesy', 0.), roll))
 
     @property
     def joequake_version(self):
@@ -4479,7 +4556,7 @@ class AsyncClient:
         except Exception:
             p = y = r = 0.0
         imp = int(impulse or 0) & 0xFF
-        payload = _make_move_body(
+        payload = self._make_move_body(
             p, y, r, 1, 0, 0, 0, imp,
             self.high_res_inputs,
             self.time if self.time is not None else self._mono_now()

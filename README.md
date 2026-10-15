@@ -10,6 +10,14 @@ python3 -m pyquake.client denver.quakeone.com 26000
 
 The port defaults to 26000 when omitted. Use `python` or `py` in place of `python3` on Windows. Direct invocation also works: `python3 pyquake/client.py localhost 26000`.
 
+QSS-M connections negotiate replacement entity deltas, prediction information,
+and extended size encoding (`PEXT2` mask `0x68`) over protocols 15, 666, and 999.
+The client handles frame acknowledgements, persistent entity state, replacement
+stats, and demos recorded after joining. The protocol banner reflects the
+extensions actually selected by the server. Servers without these extensions
+use the base protocol. CSQC, downloads, voice, and cursor extensions are not
+advertised.
+
 Record a demo with `--demo` (saved as `pyquake.dem` when stopped or disconnected), or check a server handshake with `test`:
 
 ```bash

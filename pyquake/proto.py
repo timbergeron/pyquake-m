@@ -68,10 +68,28 @@ class ProtocolVersion(enum.IntEnum):
     RMQ = 999
 
 
+PROTOCOL_FTE_PEXT1 = int.from_bytes(b'FTEX', 'little')
+PROTOCOL_FTE_PEXT2 = int.from_bytes(b'FTE2', 'little')
+PEXT2_REPLACEMENTDELTAS = 0x08
+PEXT2_PREDINFO = 0x20
+PEXT2_NEWSIZEENCODING = 0x40
+PEXT2_SUPPORTED = PEXT2_REPLACEMENTDELTAS | PEXT2_PREDINFO | PEXT2_NEWSIZEENCODING
+
+
+def pext_command():
+    return f'pext {PROTOCOL_FTE_PEXT1} 0 {PROTOCOL_FTE_PEXT2} {PEXT2_SUPPORTED}'
+
+
 @dataclasses.dataclass
 class Protocol:
     version: ProtocolVersion
     flags: ProtocolFlags
+    pext1: int = 0
+    pext2: int = 0
+
+    @property
+    def name(self):
+        return f'fte{int(self.version)}' if self.pext2 else str(int(self.version))
 
 
 class TempEntityTypes(enum.IntEnum):
@@ -113,7 +131,8 @@ class ServerMessageType(enum.Enum):
     PARTICLE = 18
     DAMAGE = 19
     SPAWNSTATIC = 20
-    SPAWNBINARY = 21
+    FTE_SPAWNSTATIC = 21
+    SPAWNBINARY = 21  # Historical name for this previously unused opcode.
     SPAWNBASELINE = 22
     TEMP_ENTITY = 23
     SETPAUSE = 24
@@ -136,6 +155,16 @@ class ServerMessageType(enum.Enum):
     SPAWNBASELINE2 = 42
     SPAWNSTATIC2 = 43
     SPAWNSTATICSOUND2 = 44
+    UPDATESTATBYTE = 51
+    PRECACHE = 54
+    DP_SPAWNSTATICSOUND = 59
+    TRAILPARTICLES = 60
+    POINTPARTICLES = 61
+    POINTPARTICLES1 = 62
+    FTE_SPAWNBASELINE = 66
+    UPDATESTATSTRING = 78
+    UPDATESTATFLOAT = 79
+    UPDATEENTITIES = 86
 
 
 class ItemFlags(enum.IntFlag):
@@ -269,6 +298,7 @@ class _BaselineBits(enum.IntFlag):
 _MESSAGE_CLASSES = {}
 def _register_server_message(cls):
     _MESSAGE_CLASSES[cls.msg_type] = cls
+    return cls
 
 
 _DEFAULT_VIEW_HEIGHT = 22
@@ -369,6 +399,14 @@ class ServerMessage:
     @classmethod
     def _parse_coords(cls, m, protocol):
         return cls._parse_tuple(3, cls._parse_coord, m, protocol)
+
+    @classmethod
+    def _parse_entity(cls, m, protocol):
+        (entity,), m = cls._parse_struct('<H', m)
+        if protocol.pext2 & PEXT2_REPLACEMENTDELTAS and entity & 0x8000:
+            (low,), m = cls._parse_struct('<B', m)
+            entity = ((entity & 0x7fff) << 8) | low
+        return entity, m
 
     @classmethod
     def _parse_optional(cls, bit, flags, fmt, m, post_func=None, default=None):
@@ -600,7 +638,8 @@ class ServerMessageVersion(ServerMessage):
         except ValueError as exc:
             raise UnsupportedProtocol(f"Unsupported protocol: {version}") from exc
         flags = protocol.flags if protocol is not None and protocol.version == version else ProtocolFlags(0)
-        return cls(Protocol(version, flags)), m
+        next_protocol = dataclasses.replace(protocol) if protocol is not None and protocol.version == version else Protocol(version, flags)
+        return cls(next_protocol), m
 
 
 @_register_server_message
@@ -730,6 +769,17 @@ class ServerMessageSpawnStaticSound2(_SpawnStaticSoundBase):
 
 
 @_register_server_message
+class ServerMessageDPStaticSound(ServerMessageSpawnStaticSound2):
+    msg_type = ServerMessageType.DP_SPAWNSTATICSOUND
+
+    @classmethod
+    def parse(cls, m, protocol):
+        if protocol is None or not protocol.pext2 & PEXT2_REPLACEMENTDELTAS:
+            raise MalformedNetworkData('Extended static sound without negotiated extension')
+        return super().parse(m, protocol)
+
+
+@_register_server_message
 class ServerMessageCdTrack(StructServerMessage):
     fmt = "<BB"
     field_names = ("track", "loop")
@@ -839,6 +889,15 @@ class ServerMessageTime(StructServerMessage):
     field_names = ("time",)
     msg_type = ServerMessageType.TIME
 
+    @classmethod
+    def parse(cls, m, protocol):
+        (time,), m = cls._parse_struct('<f', m)
+        message = cls(time)
+        message.input_ack = None
+        if protocol is not None and protocol.pext2 & PEXT2_PREDINFO:
+            (message.input_ack,), m = cls._parse_struct('<H', m)
+        return message, m
+
 
 @_register_server_message
 class ServerMessageUpdateName(ServerMessage):
@@ -914,6 +973,18 @@ class ServerMessageServerInfo(ServerMessage):
     @classmethod
     def parse(cls, m, protocol):
         (protocol_version,), m = cls._parse_struct("<I", m)
+        extensions = {PROTOCOL_FTE_PEXT1: 0, PROTOCOL_FTE_PEXT2: 0}
+        seen = set()
+        while protocol_version in extensions:
+            if protocol_version in seen:
+                raise MalformedNetworkData('Duplicate PEXT header')
+            seen.add(protocol_version)
+            (extensions[protocol_version], protocol_version), m = cls._parse_struct('<II', m)
+        pext1, pext2 = extensions.values()
+        if pext1 or pext2 & ~PEXT2_SUPPORTED:
+            raise UnsupportedProtocol(f'Unsupported extensions: {pext1:#x}/{pext2:#x}')
+        if pext2 & PEXT2_PREDINFO and not pext2 & PEXT2_REPLACEMENTDELTAS:
+            raise UnsupportedProtocol('PREDINFO requires REPLACEMENTDELTAS')
         try:
             protocol_version = ProtocolVersion(protocol_version)
         except ValueError as exc:
@@ -925,14 +996,19 @@ class ServerMessageServerInfo(ServerMessage):
         else:
             protocol_flags = ProtocolFlags(0)
 
-        next_protocol = Protocol(protocol_version, protocol_flags)
+        next_protocol = Protocol(protocol_version, protocol_flags, pext1, pext2)
+        gamedir = ''
+        if pext2 & PEXT2_PREDINFO:
+            gamedir, m = cls._parse_string(m)
 
         (max_clients, game_type), m = cls._parse_struct("<BB", m)
         level_name, m = cls._parse_string(m)
         models, m = cls._parse_string_list(m)
         sounds, m = cls._parse_string_list(m)
 
-        return cls(next_protocol, max_clients, game_type, level_name, models, sounds), m
+        message = cls(next_protocol, max_clients, game_type, level_name, models, sounds)
+        message.gamedir = gamedir
+        return message, m
 
 
 @_register_server_message
@@ -1047,13 +1123,32 @@ class ServerMessageSound(ServerMessage):
     @classmethod
     def parse(cls, m, protocol):
         flags, m = _SoundFlags(m[0]), m[1:]
+        replacement = bool(protocol.pext2 & PEXT2_REPLACEMENTDELTAS)
+        if replacement and flags & 4:
+            # FTE's unsigned integer uses leading one bits to count following bytes.
+            (head,), m = cls._parse_struct('<B', m)
+            count = 0
+            marker = 128
+            while marker and head & marker:
+                head -= marker
+                count += 1
+                marker >>= 1
+            extra = head
+            for _ in range(count):
+                (byte,), m = cls._parse_struct('<B', m)
+                extra = (extra << 8) | byte
+            flags = int(flags) | (extra << 8)
 
         volume, m = cls._parse_optional(_SoundFlags.VOLUME, flags, "<B", m,
                                         default=_DEFAULT_SOUND_PACKET_VOLUME)
         attenuation, m = cls._parse_optional(_SoundFlags.ATTENUATION, flags, "<B", m, lambda b: b / 64.,
                                              default=_DEFAULT_SOUND_PACKET_ATTENUATION)
 
-        if protocol.version == ProtocolVersion.NETQUAKE:
+        if replacement:
+            for flag, fmt in ((128, '<B'), (64, '<h'), (256, '<hhh'), (32, '<h')):
+                if flags & flag:
+                    _, m = cls._parse_struct(fmt, m)
+        elif protocol.version == ProtocolVersion.NETQUAKE:
             fq_flags = flags & _SoundFlags.fitzquake_flags()
             if fq_flags:
                 raise MalformedNetworkData(f'{fq_flags} passed but protocol is {protocol}')
@@ -1090,6 +1185,359 @@ class ServerMessageParticle(ServerMessage):
         color, m = m[0], m[1:]
 
         return cls(origin, direction, count, color), m
+
+
+@dataclasses.dataclass
+class FTEDelta:
+    """Decoded fields and their wire bytes, retained for bounded demo snapshots."""
+    reset: bool
+    values: dict
+    payloads: dict
+
+
+_FTE_ORDER = ('frame', 'originxy', 'originz', 'anglesxz', 'anglesy', 'effects',
+              'prediction', 'model_num', 'skin', 'colormap', 'solid', 'eflags',
+              'alpha', 'scale', 'bones', 'drawflags', 'tag', 'light', 'trail',
+              'colormod', 'glow', 'fatness', 'model2', 'gravity')
+
+
+def merge_fte_delta(previous, baseline, delta):
+    source = baseline if delta.reset or previous is None else previous
+    values = dict(source.values) if source is not None else {}
+    payloads = dict(source.payloads) if source is not None else {}
+    # Velocity is sent afresh on every delta, unlike ordinary persistent fields.
+    values['velocity'] = (0., 0., 0.)
+    values.update(delta.values)
+    payloads.update(delta.payloads)
+    return FTEDelta(False, values, payloads)
+
+
+def encode_fte_delta(state, protocol):
+    """Serialize a complete reset for a demo begun during a live session."""
+    payloads = dict(state.payloads)
+    # Rebuild prediction from current values: old velocity bytes must not persist.
+    velocity = state.values.get('velocity', (0., 0., 0.))
+    predbits = 8 | 16 | 32
+    prediction = struct.pack('<BBhhh', predbits, state.values.get('movetype', 0),
+                             *(round(v * 8) for v in velocity))
+    payloads['prediction'] = (1 << 6, prediction)
+    if not protocol.pext2 & PEXT2_PREDINFO:
+        # UF_PREDINFO selects 16-bit angles in the older delta dialect. Recode
+        # angles which may have arrived in deltas without prediction fields.
+        for name, bit in (('anglesxz', 8), ('anglesy', 16)):
+            if name in state.values:
+                angles = state.values[name] if name == 'anglesxz' else (state.values[name],)
+                if protocol.flags & ProtocolFlags.FLOATANGLE:
+                    data = struct.pack('<' + 'f' * len(angles), *(math.degrees(v) for v in angles))
+                else:
+                    data = struct.pack('<' + 'H' * len(angles),
+                                       *(round(v * 32768 / math.pi) & 65535 for v in angles))
+                payloads[name] = (bit, data)
+    bits = 1 << 8  # UF_RESET
+    for flags, _ in payloads.values():
+        bits |= flags
+    wide = bool(bits & (1 << 9))
+    body = bytearray()
+    for name in _FTE_ORDER:
+        if name not in payloads:
+            continue
+        flags, data = payloads[name]
+        if wide and name in ('frame', 'model_num', 'skin', 'model2') and not flags & (1 << 9):
+            data += b'\0'
+        body.extend(data)
+    return _encode_fte_bits(bits) + body
+
+
+def _encode_fte_bits(bits):
+    if bits & 0xffffff00:
+        bits |= 1 << 7
+    if bits & 0xffff0000:
+        bits |= 1 << 15
+    if bits & 0xff000000:
+        bits |= 1 << 23
+    return bytes((bits >> shift) & 255 for shift in (0, 8, 16, 24)
+                 if shift == 0 or bits & (1 << (shift - 1)))
+
+
+def encode_fte_entity_number(entity):
+    if not 0 < entity < (1 << 22):
+        raise ValueError('Replacement entity number out of range')
+    if entity >= 0x4000:
+        return struct.pack('<HB', 0x4000 | (entity & 0x3fff), entity >> 14)
+    return struct.pack('<H', entity)
+
+
+class _FTEDeltaReader:
+    def __init__(self, data, protocol):
+        self.m = self.start = data
+        self.protocol = protocol
+        self.values = {}
+        self.payloads = {}
+
+    def read(self, fmt):
+        values, self.m = ServerMessage._parse_struct('<' + fmt, self.m)
+        return values[0] if len(values) == 1 else values
+
+    def save(self, name, flags, value=None):
+        if value is not None:
+            self.values[name] = value
+        self.payloads[name] = (flags, self.start[:len(self.start) - len(self.m)])
+        self.start = self.m
+
+    def coord(self):
+        value, self.m = ServerMessage._parse_coord(self.m, self.protocol)
+        return value
+
+    def angle(self, high=False):
+        protocol = self.protocol
+        if high and not protocol.flags & ProtocolFlags.FLOATANGLE:
+            protocol = dataclasses.replace(protocol, flags=protocol.flags | ProtocolFlags.SHORTANGLE)
+        value, self.m = ServerMessage._parse_angle(self.m, protocol)
+        return value
+
+
+def _parse_fte_delta(m, protocol):
+    r = _FTEDeltaReader(m, protocol)
+    bits = r.read('B')
+    for flag, shift in ((7, 8), (15, 16), (23, 24)):
+        if bits & (1 << flag):
+            bits |= r.read('B') << shift
+    if bits & 0xc0000000:
+        raise UnsupportedProtocol('Unknown replacement delta flags')
+    r.start = r.m
+    wide = bits & (1 << 9)
+    size = 'H' if wide else 'B'
+    if bits & 1:
+        r.save('frame', 1 | wide, r.read(size))
+    if bits & 2:
+        r.save('originxy', 2, (r.coord(), r.coord()))
+    if bits & 4:
+        r.save('originz', 4, r.coord())
+    high = bool(bits & 64 and not protocol.pext2 & PEXT2_PREDINFO)
+    if bits & 8:
+        r.save('anglesxz', 8, (r.angle(high), r.angle(high)))
+    if bits & 16:
+        r.save('anglesy', 16, r.angle(high))
+    effects = bits & ((1 << 5) | (1 << 29))
+    if effects:
+        fmt = 'I' if effects == ((1 << 5) | (1 << 29)) else 'H' if effects & (1 << 29) else 'B'
+        r.save('effects', effects, r.read(fmt))
+    if bits & 64:
+        pred = r.read('B')
+        for flag in (1, 2, 4):
+            if pred & flag:
+                r.read('h')
+        if pred & 8:
+            r.values['movetype'] = r.read('B')
+        xy = r.read('hh') if pred & 16 else (0, 0)
+        z = r.read('h') if pred & 32 else 0
+        r.values['velocity'] = tuple(v / 8 for v in (*xy, z))
+        if pred & 64:
+            r.read('B')
+        if pred & 128:
+            if protocol.pext2 & PEXT2_PREDINFO:
+                if bits & 8:
+                    r.read('HH')
+                if bits & 16:
+                    r.read('H')
+            elif r.read('B') & 128:
+                r.read('B')
+        r.save('prediction', 64)
+    for name, flag, fmt in (('model_num', 10, size), ('skin', 11, size), ('colormap', 12, 'B')):
+        if bits & (1 << flag):
+            r.save(name, (1 << flag) | (wide if flag != 12 else 0), r.read(fmt))
+    if bits & (1 << 13):
+        if protocol.pext2 & PEXT2_NEWSIZEENCODING:
+            encoding = r.read('B')
+            if encoding not in (0, 1, 2, 3, 16, 32):
+                raise MalformedNetworkData(f'Unknown solid encoding: {encoding}')
+            solid = (encoding, r.read('H' if encoding == 16 else 'I') if encoding in (16, 32) else None)
+        else:
+            solid = (16, r.read('H'))
+        r.save('solid', 1 << 13, solid)
+    for name, flag in (('eflags', 14), ('alpha', 16), ('scale', 17)):
+        if bits & (1 << flag):
+            r.save(name, 1 << flag, r.read('B'))
+    if bits & (1 << 18):
+        flags = r.read('B')
+        if flags & 0x3f:
+            raise UnsupportedProtocol('Unknown bone data flags')
+        if flags & 0x80:
+            for _ in range(r.read('B') * 7):
+                r.read('h')
+        if flags & 0x40:
+            r.read('BH')
+        r.save('bones', 1 << 18)
+    if bits & (1 << 19):
+        flags = r.read('B')
+        if flags & 7 == 7:
+            r.read('B')
+        r.save('drawflags', 1 << 19, flags)
+    if bits & (1 << 20):
+        entity, r.m = ServerMessage._parse_entity(r.m, protocol)
+        r.save('tag', 1 << 20, (entity, r.read('B')))
+    if bits & (1 << 21):
+        r.read('hhhhBB')
+        r.save('light', 1 << 21)
+    if bits & (1 << 22):
+        trail = r.read('H')
+        if trail & 0x8000:
+            r.read('H')
+        r.save('trail', 1 << 22)
+    for name, flag, fmt in (('colormod', 24, 'BBB'), ('glow', 25, 'BBBBB'),
+                             ('fatness', 26, 'B'), ('model2', 27, size), ('gravity', 28, 'BB')):
+        if bits & (1 << flag):
+            r.save(name, (1 << flag) | (wide if flag == 27 else 0), r.read(fmt))
+    return FTEDelta(bool(bits & 256), r.values, r.payloads), r.m
+
+
+class _FTEMessage(ServerMessage):
+    @classmethod
+    def require_extension(cls, protocol):
+        if protocol is None or not protocol.pext2 & PEXT2_REPLACEMENTDELTAS:
+            raise MalformedNetworkData('Replacement delta message without negotiated extension')
+
+
+@_register_server_message
+class ServerMessageUpdateEntities(_FTEMessage):
+    field_names = ('time', 'input_ack', 'updates')
+    msg_type = ServerMessageType.UPDATEENTITIES
+
+    @classmethod
+    def parse(cls, m, protocol):
+        cls.require_extension(protocol)
+        ack = None
+        if protocol.pext2 & PEXT2_PREDINFO:
+            (ack,), m = cls._parse_struct('<H', m)
+        (time,), m = cls._parse_struct('<f', m)
+        updates = []
+        while True:
+            (number,), m = cls._parse_struct('<H', m)
+            remove = bool(number & 0x8000)
+            if number & 0x4000:
+                (high,), m = cls._parse_struct('<B', m)
+                number = (number & 0x3fff) | (high << 14)
+            else:
+                number &= 0x7fff
+            if not number and not remove:
+                break
+            delta = None
+            if not remove:
+                delta, m = _parse_fte_delta(m, protocol)
+            updates.append((number, delta))
+        return cls(time, ack, updates), m
+
+
+@_register_server_message
+class ServerMessageFTEBaseline(_FTEMessage):
+    field_names = ('entity_num', 'delta')
+    msg_type = ServerMessageType.FTE_SPAWNBASELINE
+
+    @classmethod
+    def parse(cls, m, protocol):
+        cls.require_extension(protocol)
+        entity, m = cls._parse_entity(m, protocol)
+        delta, m = _parse_fte_delta(m, protocol)
+        return cls(entity, delta), m
+
+
+@_register_server_message
+class ServerMessageFTEStatic(_FTEMessage):
+    field_names = ('delta',)
+    msg_type = ServerMessageType.FTE_SPAWNSTATIC
+
+    @classmethod
+    def parse(cls, m, protocol):
+        cls.require_extension(protocol)
+        delta, m = _parse_fte_delta(m, protocol)
+        return cls(delta), m
+
+
+@_register_server_message
+class ServerMessageUpdateStatByte(_FTEMessage, StructServerMessage):
+    field_names = ('index', 'value')
+    fmt = '<BB'
+    msg_type = ServerMessageType.UPDATESTATBYTE
+
+    @classmethod
+    def parse(cls, m, protocol):
+        cls.require_extension(protocol)
+        return super().parse(m, protocol)
+
+
+@_register_server_message
+class ServerMessageUpdateStatFloat(ServerMessageUpdateStatByte):
+    fmt = '<Bf'
+    msg_type = ServerMessageType.UPDATESTATFLOAT
+
+
+@_register_server_message
+class ServerMessageUpdateStatString(_FTEMessage):
+    field_names = ('index', 'value')
+    msg_type = ServerMessageType.UPDATESTATSTRING
+
+    @classmethod
+    def parse(cls, m, protocol):
+        cls.require_extension(protocol)
+        (index,), m = cls._parse_struct('<B', m)
+        value, m = cls._parse_string(m)
+        return cls(index, value), m
+
+
+@_register_server_message
+class ServerMessagePrecache(_FTEMessage):
+    field_names = ('index', 'name')
+    msg_type = ServerMessageType.PRECACHE
+
+    @classmethod
+    def parse(cls, m, protocol):
+        cls.require_extension(protocol)
+        (index,), m = cls._parse_struct('<H', m)
+        name, m = cls._parse_string(m)
+        return cls(index, name), m
+
+
+@_register_server_message
+class ServerMessageTrailParticles(_FTEMessage):
+    field_names = ('entity_num', 'effect', 'start', 'end')
+    msg_type = ServerMessageType.TRAILPARTICLES
+
+    @classmethod
+    def parse(cls, m, protocol):
+        cls.require_extension(protocol)
+        (entity,), m = cls._parse_struct('<H', m)
+        (effect,), m = cls._parse_struct('<H', m)
+        start, m = cls._parse_coords(m, protocol)
+        end, m = cls._parse_coords(m, protocol)
+        return cls(entity, effect, start, end), m
+
+
+@_register_server_message
+class ServerMessagePointParticles(_FTEMessage):
+    field_names = ('effect', 'origin', 'velocity', 'count')
+    msg_type = ServerMessageType.POINTPARTICLES
+
+    @classmethod
+    def parse(cls, m, protocol):
+        cls.require_extension(protocol)
+        (effect,), m = cls._parse_struct('<H', m)
+        origin, m = cls._parse_coords(m, protocol)
+        velocity, m = cls._parse_coords(m, protocol)
+        (count,), m = cls._parse_struct('<H', m)
+        return cls(effect, origin, velocity, count), m
+
+
+@_register_server_message
+class ServerMessagePointParticles1(_FTEMessage):
+    field_names = ('effect', 'origin')
+    msg_type = ServerMessageType.POINTPARTICLES1
+
+    @classmethod
+    def parse(cls, m, protocol):
+        cls.require_extension(protocol)
+        (effect,), m = cls._parse_struct('<H', m)
+        origin, m = cls._parse_coords(m, protocol)
+        return cls(effect, origin), m
 
 
 @_register_server_message
