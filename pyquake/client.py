@@ -4091,7 +4091,7 @@ class AsyncClient:
                     has_server_info = True
 
                     if parsed.protocol != self.protocol:
-                        CON.write(f"Using protocol {parsed.protocol.name}")
+                        CON.write(f"  Using protocol {parsed.protocol.name}")
                     self.protocol = parsed.protocol
                     self._pext_bits = [proto.PROTOCOL_FTE_PEXT1, self.protocol.pext1,
                                        proto.PROTOCOL_FTE_PEXT2, self.protocol.pext2]

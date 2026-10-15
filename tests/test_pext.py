@@ -189,7 +189,7 @@ class PextClientTests(unittest.IsolatedAsyncioTestCase):
         from pyquake import client
         from test_proto import server_info
         await self.receive(server_info(666))
-        client.CON.write.assert_any_call('Using protocol 666')
+        client.CON.write.assert_any_call('  Using protocol 666')
         self.assertEqual(self.client.protocol.pext2, 0)
 
     async def test_persistent_entities_removals_resets_stats_and_acks(self):
