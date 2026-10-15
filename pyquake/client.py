@@ -57,10 +57,14 @@ from threading import Event
 
 if __package__:
     from . import aiodgram, proto
+    from .demo import Demo, recover_demo
+    from .downloads import DownloadError, DownloadManager, register_cvars as register_download_cvars
     from .iplog import IpLog, StatusParser
     from .commands import define_alias, split_commands, quote_arg
     from .console import ConsoleSession, SERVER_COMMANDS
 else:
+    from demo import Demo, recover_demo
+    from downloads import DownloadError, DownloadManager, register_cvars as register_download_cvars
     import aiodgram
     import proto
     from iplog import IpLog, StatusParser
@@ -1274,7 +1278,7 @@ def _split_queued_commands(s: str) -> list[str]:
 
 # Built-in client commands that shouldn't be shadowed; used for conflict rename.
 _RESERVED_CMDS = frozenset({
-    "help","cmdlist","aliaslist","clear","quit","exit","q","scoreboard","extip","disconnect","connect","reconnect","demo","record","stop","kill","status",
+    "help","cmdlist","aliaslist","clear","quit","exit","q","scoreboard","extip","disconnect","connect","reconnect","demo","record","stop","markdemo","recoverdemo","kill","status",
     "players","showscores","ping","impulse","name","color","say","say_team","tell","dm","pm","like",
     "condump","echo","exec","ip","extip","port","random","cmd","rcon",
     "reset","resetall","resetcfg","s","st","net_stats","unalias","unaliasall","wait",
@@ -1286,7 +1290,7 @@ _RESERVED_CMDS = frozenset({
     "say_random5","say_random6","say_random7","say_random8","say_random9",
     # new local commands (reserve so server can't shadow them)
     "find","apropos","aliasedit",
-    "identify","ipdump","ipmerge","ipnames",
+    "identify","ipdump","ipmerge","ipnames","download","stopdownload",
     # temp local debug command so servers can't shadow it
     "infotest",
     # cvar-related builtins
@@ -2210,6 +2214,15 @@ def _print_cmdlist():
     print("  port [n]            - Show/set default server port (for connect)")
     print("  random <a> <b> ...  - Pick a random option; says result if connected")
     print("  net_stats [*]        - Show basic network stats (client-side)")
+    print("  record [filename]    - Record a demo; default is demos/map_timestamp.dem")
+    print("  stop                 - Save the current demo (or retry a failed save)")
+    print("  markdemo             - Mark the current demo, or show saved marker history")
+    print("  recoverdemo src dst  - Recover an interrupted recording to a new .dem file")
+    print("  cl_autodemo 0..4     - 0=off, 1=maps, 2=matches, 3=multiplayer maps, 4=map cuts")
+    print("  cl_demo_format dem|dz - Choose raw or DZip recording output")
+    print("  download file [auto|web|server] - Fetch a missing game asset")
+    print("  stopdownload         - Cancel the current asset download")
+    print("  cl_download_dir      - Game directory for asset lookup and downloads (default id1)")
     print("  wait [n]             - Defer the rest of the buffer until next frame (optionally N frames)")
     print("  say_rand0..9 [team] - Say a randomized line from msgrand#.txt")
     print("  unalias <name>      - Delete an alias")
@@ -2238,8 +2251,6 @@ def _print_cmdlist():
     print("  clear               - Clear the client console")
     print("  condump [file]      - Dump console text to file (default condump.txt)")
     print("  quit                - Disconnect from server")
-    print("  demo/record [file]  - Start a demo (default pyquake.dem)")
-    print("  stop                - Stop and save the demo")
     print("  kill                - Suicide")
     print("  status              - Show server status")
     print("  identify [WHO|IP]   - Show locally known player aliases (slots start at 1)")
@@ -2905,69 +2916,6 @@ def _clear_console():
         print("\n" * 100)
 
 
-class Demo:
-    def __init__(self):
-        self._msgs = []
-        self._angles = []
-        self.record_pending = False
-        self.recording_started = False
-        self.recording_complete = False
-
-    def start_recording(self):
-        self.record_pending = True
-
-    def stop_recording(self):
-        if self.recording_started:
-            # QSS-M expects svc_disconnect rather than an abrupt EOF.
-            self._msgs.append(b'\x02')
-            self._angles.append(self._angles[-1])
-        self.record_pending = self.recording_started = False
-        self.recording_complete = True
-
-    def add_message(self, angles, msg, has_server_info):
-        if self.record_pending:
-            if has_server_info:
-                self.record_pending = False
-                self.recording_started = True
-        elif self.recording_complete:
-            raise Exception("add_message called when recording is complete")
-
-        if self.recording_started:
-            self._msgs.append(msg)
-            self._angles.append(tuple(angles))
-
-    def _parse_messages(self):
-        protocol = proto.Protocol(proto.ProtocolVersion.NETQUAKE, proto.ProtocolFlags(0))
-        for msg in self._msgs:
-            parsed_msgs = []
-            remaining_msg = msg
-            while remaining_msg:
-                parsed, remaining_msg = proto.ServerMessage.parse_message(
-                        remaining_msg, protocol)
-                if parsed.msg_type in (proto.ServerMessageType.SERVERINFO, proto.ServerMessageType.VERSION):
-                    protocol = parsed.protocol
-                parsed_msgs.append(parsed)
-            yield parsed_msgs
-
-    def dump(self, f, *, angle_calculator=None):
-        f.write(b'-1\n')   # cd track
-        demo_header_fmt = "<Ifff"
-
-        if angle_calculator is not None:
-            all_angles = angle_calculator.calculate(self._parse_messages())
-        else:
-            all_angles = self._angles
-
-        for msg, angles in zip(self._msgs, all_angles):
-            f.write(struct.pack(demo_header_fmt,
-                                len(msg),
-                                *(180. * a / math.pi for a in angles)))
-            if isinstance(msg, str):
-                f.write(msg.encode('latin-1'))  # Convert string to bytes
-            else:
-                f.write(msg)  # Already bytes
-
-
 class _BaseAngleCalculator:
     """Pass into `Demo.dump` to override view angles."""
 
@@ -3112,6 +3060,9 @@ class AsyncClient:
         self.last_rx_at = self._mono0
         self.last_tx_at = self._mono0
         self._alive = True
+        download_cvars = globals().get("cvar_system") or CvarSystem()
+        register_download_cvars(sys.modules[__name__], download_cvars)
+        self.downloads = DownloadManager(self, download_cvars, CON.write)
         self._spawned_fut = asyncio.Future()
         self._center_print_fut = asyncio.Future()
         self.protocol = proto.Protocol(
@@ -3138,6 +3089,7 @@ class AsyncClient:
         self.on_ground = None
         self.view_height = None
         self.models = None
+        self.sounds = None
         self.disconnected = False
         # Protocol-ID/mask pairs, populated from negotiated serverinfo headers.
         self._pext_bits: list[int] = [0, 0, 0, 0]
@@ -3149,6 +3101,10 @@ class AsyncClient:
         self._demo_signon = []
         self._demo_signon_complete = False
         self._demo_state = {}
+        self._demo_statics = []
+        self._demo_counters = {13: 0, 14: 0}
+        self._demo_event = None
+        self.game_type = None
         # Until we see any real inbound server message (serverinfo/signon/time),
         # we aggressively NAT-punch with small UNRELIABLE packets.
         self._signon_seen = False
@@ -3361,12 +3317,16 @@ class AsyncClient:
     def player_entity(self):
         return self.entities[self.view_entity]
 
-    def record_demo(self):
-        d = Demo()
+    def record_demo(self, path=None, *, on_error=None):
+        d = Demo(path, on_error=on_error)
         d.start_recording()
         for index, message in enumerate(self._demo_signon):
             d.add_message(self.angles, message, index == 0)
         for message in self._demo_state.values():
+            d.add_message(self.angles, message, False)
+        for message in self._demo_statics:
+            d.add_message(self.angles, message, False)
+        for message in self._demo_extra_state():
             d.add_message(self.angles, message, False)
         if self.protocol.pext2 & proto.PEXT2_REPLACEMENTDELTAS and self.time is not None:
             header = b'\x56'
@@ -3381,6 +3341,40 @@ class AsyncClient:
                               + proto.encode_fte_delta(state, self.protocol) + b'\0\0', False)
         self._demos.append(d)
         return d
+
+    def _demo_extra_state(self):
+        """Rebuild persistent stufftext state without replaying old commands/chat."""
+        def stuff(text):
+            return b"\x09" + text.encode("latin-1") + b"\0"
+
+        def pq_byte(value):
+            return chr(16 + ((value & 255) >> 4)) + chr(16 + (value & 15))
+
+        def info_text(info):
+            # Quake info strings cannot represent quotes or control characters.
+            return InfoString({k: v for k, v in info.items()
+                               if all(c not in str(k) + str(v) for c in '\"\0\n\r')}).to_string()
+
+        if self._serverinfo_is:
+            yield stuff(f'//fullserverinfo "{info_text(self._serverinfo_is)}"\n')
+        for slot, info in self._userinfo_is.items():
+            yield stuff(f'//fui {slot} "{info_text(info)}"\n')
+        # Reset the initial signon's team state before restoring the current one.
+        if self._pq_teamgame_hint:
+            yield stuff("\x01\x06")
+            for team in sorted(self._pq_team_frags.keys() | self._pq_team_colors.keys()):
+                color = self._pq_team_colors.get(team, team)
+                yield stuff("\x01\x02" + chr(16 + team) + chr(16 + (color >> 4)))
+                frags = self._pq_team_frags.get(team, 0) & 65535
+                yield stuff("\x01\x04" + chr(16 + team) + pq_byte(frags >> 8) + pq_byte(frags))
+        if self._pq_minutes is not None:
+            timer = self._current_match_time()
+            mm, ss = timer if timer is not None else (255, 0)
+            if ss < 0:
+                ss = 128 - ss
+            yield stuff("\x01\x05" + pq_byte(mm) + pq_byte(ss))
+        if self._pq_paused:
+            yield b"\x08Match paused\n\0"
 
     def _finish_status(self, success: bool) -> None:
         if self._status_waiter is not None and not self._status_waiter.done():
@@ -3429,6 +3423,37 @@ class AsyncClient:
             self._demo_signon.clear()
             self._demo_state.clear()
             self._demo_signon_complete = False
+            self._demo_statics.clear()
+            self._demo_counters = {13: 0, 14: 0}
+        if kind == proto.ServerMessageType.UPDATESTAT and parsed.index in self._demo_counters:
+            self._demo_counters[parsed.index] = parsed.value
+        if kind in (proto.ServerMessageType.KILLEDMONSTER, proto.ServerMessageType.FOUNDSECRET):
+            index = 14 if kind == proto.ServerMessageType.KILLEDMONSTER else 13
+            self._demo_counters[index] += 1
+            self._demo_state[(proto.ServerMessageType.UPDATESTAT, index)] = (
+                b"\x03" + struct.pack("<Bi", index, self._demo_counters[index]))
+        if kind in (proto.ServerMessageType.INTERMISSION, proto.ServerMessageType.FINALE,
+                    proto.ServerMessageType.CUTSCENE):
+            self._demo_state[(proto.ServerMessageType.INTERMISSION, None)] = raw
+        if kind == proto.ServerMessageType.STUFFTEXT and not parsed.string.startswith("\x01"):
+            for command in split_commands(parsed.string):
+                try:
+                    tokens = shlex.split(command)
+                    if tokens and tokens[0].lower() == "fog" and 1 <= len(tokens[1:]) <= 8:
+                        if all(math.isfinite(float(value)) for value in tokens[1:]):
+                            self._demo_state[(proto.ServerMessageType.FOG, None)] = (
+                                b"\x09" + command.encode("latin-1") + b"\n\0")
+                except ValueError:
+                    pass
+        # Signon packets already preserve their static entities, sounds and
+        # baselines. Keep additions after signon as persistent map state too.
+        if self._demo_signon_complete:
+            if kind in (proto.ServerMessageType.SPAWNSTATIC, proto.ServerMessageType.SPAWNSTATIC2,
+                        proto.ServerMessageType.FTE_SPAWNSTATIC, proto.ServerMessageType.SPAWNSTATICSOUND,
+                        proto.ServerMessageType.SPAWNSTATICSOUND2, proto.ServerMessageType.DP_SPAWNSTATICSOUND):
+                self._demo_statics.append(raw)
+            elif kind in (proto.ServerMessageType.SPAWNBASELINE, proto.ServerMessageType.SPAWNBASELINE2):
+                self._demo_state[(proto.ServerMessageType.SPAWNBASELINE, parsed.entity_num)] = raw
         indexed = {
             proto.ServerMessageType.UPDATENAME: "client_num",
             proto.ServerMessageType.UPDATEFRAGS: "client_num",
@@ -3449,12 +3474,6 @@ class AsyncClient:
                       proto.ServerMessageType.CDTRACK, proto.ServerMessageType.CLIENTDATA,
                       proto.ServerMessageType.SKYBOX, proto.ServerMessageType.FOG):
             key = (kind, None)
-        elif self._demo_signon_complete and kind in (
-                proto.ServerMessageType.SPAWNSTATIC, proto.ServerMessageType.SPAWNSTATIC2,
-                proto.ServerMessageType.FTE_SPAWNSTATIC, proto.ServerMessageType.SPAWNSTATICSOUND,
-                proto.ServerMessageType.SPAWNSTATICSOUND2, proto.ServerMessageType.DP_SPAWNSTATICSOUND):
-            # Statics persist for the map, including ones created after sign-on.
-            key = (kind, len(self._demo_state))
         else:
             return
         self._demo_state[key] = raw
@@ -3792,11 +3811,24 @@ class AsyncClient:
             has_server_info = False
             signon_complete = False
             next_entities = {}
+            demo_prints = []
+            demo_marks = 0
+            demo_parts = []
             while remaining_msg:
                 unparsed = remaining_msg
                 parsed, remaining_msg = proto.ServerMessage.parse_message(
                     remaining_msg, self.protocol
                 )
+                raw_message = unparsed[:len(unparsed) - len(remaining_msg)]
+                if parsed.msg_type == proto.ServerMessageType.DOWNLOADDATA:
+                    await self.downloads.data(parsed.offset, parsed.data)
+                    continue
+                if parsed.msg_type != proto.ServerMessageType.DISCONNECT:
+                    demo_parts.append(raw_message)
+                if parsed.msg_type == proto.ServerMessageType.SERVERINFO and self._demo_event:
+                    event = self._demo_event("map", None)
+                    if inspect.isawaitable(event):
+                        await event
                 self._cache_demo_state(parsed, unparsed[:len(unparsed) - len(remaining_msg)])
                 if parsed.msg_type == proto.ServerMessageType.SIGNONNUM and parsed.num >= 3:
                     signon_complete = True
@@ -3810,9 +3842,16 @@ class AsyncClient:
                 ):
                     self._signon_seen = True
                 if parsed.msg_type == proto.ServerMessageType.STUFFTEXT:
+                    # Download traffic is transport state, not demo content. A
+                    # stufftext record can also contain ordinary server commands.
+                    retained, consumed = await self.downloads.filter_stufftext(parsed.string)
+                    if consumed:
+                        parsed.string = retained
+                        demo_parts[-1] = (b"\x09" + parsed.string.encode("latin-1") + b"\0") if parsed.string else b""
                     DBG_ONCE("stufftext", f"STUFFTEXT: {parsed.string.strip()[:90]!r}")
                     # PQ binary prefixes can be followed by ordinary stufftext.
                     parsed.string = self._handle_proquake_stufftext(parsed.string)
+                    demo_marks += sum(line.strip() == "//demomark" for line in parsed.string.splitlines())
                     if not parsed.string:
                         continue
 
@@ -3919,6 +3958,7 @@ class AsyncClient:
 
                 # Human-visible server text (console lines, chat, kills, etc.)
                 if parsed.msg_type == proto.ServerMessageType.PRINT:
+                    demo_prints.append(parsed.string)
                     self._read_status_print(parsed.string)
                     clean = _strip_quake_colors(parsed.string).strip()
                     DBG_ONCE("print", f"PRINT: {clean[:90]!r}")
@@ -3997,6 +4037,7 @@ class AsyncClient:
 
                 # Player goes "unspawned" when server info received (see SV_SendServerinfo).
                 if parsed.msg_type == proto.ServerMessageType.SERVERINFO:
+                    self.downloads.cancel()
                     # Auto-save on map change: any new SERVERINFO with a different level
                     try:
                         if self.level_name and parsed.level_name and parsed.level_name != self.level_name:
@@ -4009,6 +4050,7 @@ class AsyncClient:
                     # Reset centerprint dedupe on new level/serverinfo.
                     self._last_centerprint_logged = None
                     self.level_name = parsed.level_name
+                    self.game_type = parsed.game_type
                     self.view_entity = None
                     self.level_finished = False
                     self.time = None
@@ -4024,7 +4066,6 @@ class AsyncClient:
                     self.on_ground = None
                     self.view_height = None
                     self.gamedir = parsed.gamedir
-                    self.sounds = parsed.sounds
                     self._userinfo_is.clear()
                     self._synthetic_userinfo.clear()
                     self._latest_ping_by_name.clear()
@@ -4041,6 +4082,7 @@ class AsyncClient:
                     if self._spawned_fut.done():
                         self._spawned_fut = asyncio.Future()
                     self.models = parsed.models
+                    self.sounds = parsed.sounds
                     has_server_info = True
 
                     if parsed.protocol != self.protocol:
@@ -4225,7 +4267,8 @@ class AsyncClient:
                         except Exception:
                             pass
                         # Proceed with prespawn
-                        await self.send_reliable_raw(_make_cmd_body("prespawn"))
+                        if not self.downloads.signon(self.models, self.sounds):
+                            await self.send_reliable_raw(_make_cmd_body("prespawn"))
                     elif parsed.num == 2:
                         # Do not override name/color here; just spawn.
                         await self.send_reliable_raw(_make_cmd_body("spawn "))
@@ -4342,7 +4385,6 @@ class AsyncClient:
                 if parsed.msg_type == proto.ServerMessageType.DISCONNECT:
                     # Preserve the messages preceding this disconnect.
                     # stop_recording supplies the final marker after capture.
-                    wire_msg = wire_msg[:len(wire_msg) - len(remaining_msg) - 1]
                     self.disconnected = True
                     self._alive = False
                     # Auto-save on server-initiated disconnect
@@ -4368,7 +4410,8 @@ class AsyncClient:
             except Exception:
                 pass
 
-            if has_server_info or (self._demo_signon and not self._demo_signon_complete):
+            wire_msg = b"".join(demo_parts)
+            if wire_msg and (has_server_info or (self._demo_signon and not self._demo_signon_complete)):
                 self._demo_signon.append(bytes(wire_msg))
             if signon_complete:
                 self._demo_signon_complete = True
@@ -4378,6 +4421,14 @@ class AsyncClient:
                 for demo in self._demos:
                     if wire_msg:
                         demo.add_message(self.angles, wire_msg, has_server_info)
+                        if demo.recording_started:
+                            for _ in range(demo_marks):
+                                map_name = self.models[0].removeprefix("maps/").removesuffix(".bsp") if self.models else "unknown"
+                                demo.note_marker(demo.message_count, map_name)
+            if self._demo_event:
+                event = self._demo_event("packet", (signon_complete, demo_prints))
+                if inspect.isawaitable(event):
+                    await event
             if self.disconnected:
                 return
 
@@ -4391,8 +4442,12 @@ class AsyncClient:
         return await asyncio.shield(self._center_print_fut)
 
     def _reader_finished(self, task):
+        self.downloads.cancel()
         for demo in self._demos:
-            demo.stop_recording()
+            try:
+                demo.stop_recording()
+            except OSError as exc:
+                logger.warning("Could not finish demo; recovery file %s: %s", demo.recovery_path, exc)
         exc = None if task.cancelled() else task.exception()
         if exc is not None:
             logger.warning("Connection closed: %s", exc)
@@ -4494,6 +4549,7 @@ class AsyncClient:
         self.disconnected = True
         self._alive = False
         self._finish_status(False)
+        await self.downloads.close()
         if self._read_task is not None:
             self._read_task.cancel()
             await asyncio.gather(self._read_task, return_exceptions=True)

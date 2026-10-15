@@ -107,6 +107,63 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([m.level_name for _, _, m in proto.read_demo_file(output)
                               if m.msg_type == proto.ServerMessageType.SERVERINFO], levels)
 
+    async def test_mid_map_demo_restores_current_info_teams_clock_and_late_statics(self):
+        await self.receive(server_info(666) + b"\x19\x03")
+        await self.receive(b'\x09//fullserverinfo "\\hostname\\old"\n\0')
+        await self.receive(b'\x09//svi "hostname" "current"\n//fui 0 "\\name\\player"\n\0')
+        await self.receive(b'\x09//ui 0 "team" "blue"\n\0')
+        def pq_byte(value):
+            return bytes((16 + ((value & 255) >> 4), 16 + (value & 15)))
+        await self.receive(b"\x07" + struct.pack("<f", 100))
+        await self.receive(b"\x09\x01\x02\x14\x13\0")
+        await self.receive(b"\x09\x01\x04\x14" + pq_byte(255) + pq_byte(251) + b"\0")
+        await self.receive(b"\x09\x01\x05" + pq_byte(5) + pq_byte(0) + b"\0")
+        await self.receive(b"\x07" + struct.pack("<f", 110) + b"\x08Match paused\n\0")
+        static = b"\x14" + bytes(13)
+        sound = b"\x1d" + bytes(9)
+        baseline = b"\x16" + struct.pack("<H", 99) + bytes(13)
+        await self.receive(static + sound + baseline + b"\x1b\x1c")
+        demo = self.client.record_demo()
+        demo.stop_recording()
+        output = io.BytesIO()
+        demo.dump(output)
+        output.seek(0)
+        parsed = [m for _, _, m in proto.read_demo_file(output)]
+        self.assertEqual(sum(m.msg_type == proto.ServerMessageType.SPAWNSTATIC for m in parsed), 1)
+        self.assertEqual(sum(m.msg_type == proto.ServerMessageType.SPAWNSTATICSOUND for m in parsed), 1)
+        self.assertTrue(any(m.msg_type == proto.ServerMessageType.SPAWNBASELINE and m.entity_num == 99 for m in parsed))
+        self.assertEqual({m.index: m.value for m in parsed if m.msg_type == proto.ServerMessageType.UPDATESTAT}, {13: 1, 14: 1})
+        replay = client.AsyncClient(FakeConnection())
+        replay._read_task = asyncio.create_task(replay._read_messages())
+        replay._read_task.add_done_callback(replay._reader_finished)
+        try:
+            for message in demo._msgs[:-1]:
+                replay._conn.incoming.put_nowait(message)
+            for _ in range(10):
+                await asyncio.sleep(0)
+            if replay._read_task.done():
+                replay._read_task.result()
+            self.assertEqual(replay.serverinfo_get("hostname"), "current")
+            self.assertEqual(replay.userinfo_get(0, "team"), "blue")
+            self.assertEqual(replay._pq_team_frags, {4: -5})
+            self.assertEqual(replay._current_match_time(), (4, 50))
+            self.assertTrue(replay._pq_paused)
+        finally:
+            await replay.disconnect()
+
+    async def test_mid_map_cache_forgets_late_statics_and_counters_on_map_change(self):
+        await self.receive(server_info(666) + b"\x19\x03")
+        await self.receive(b"\x14" + bytes(13) + b"\x1b\x1c")
+        await self.receive(server_info(666, b"new") + b"\x19\x03")
+        demo = self.client.record_demo()
+        demo.stop_recording()
+        output = io.BytesIO()
+        demo.dump(output)
+        output.seek(0)
+        kinds = [m.msg_type for _, _, m in proto.read_demo_file(output)]
+        self.assertNotIn(proto.ServerMessageType.SPAWNSTATIC, kinds)
+        self.assertNotIn(proto.ServerMessageType.UPDATESTAT, kinds)
+
     async def test_demo_started_before_signon_records_and_stops_once(self):
         demo = self.client.record_demo()
         await self.receive(b"\x08negotiating\0")

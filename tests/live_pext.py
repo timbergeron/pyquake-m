@@ -23,6 +23,7 @@ async def verify(args, version, mask):
     with tempfile.TemporaryDirectory(prefix='pyquake-pext-', dir=args.work_dir) as root:
         root = Path(root)
         (root / 'id1').mkdir()
+        client.cvar_system.set('cl_download_dir', str(root / 'id1'))
         for pak in Path(args.paks).glob('pak*.pak'):
             (root / 'id1' / pak.name).symlink_to(pak.resolve())
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as reserve:
@@ -41,7 +42,7 @@ async def verify(args, version, mask):
                 for _ in range(100):
                     if server.poll() is not None:
                         raise RuntimeError(log_path.read_text())
-                    if 'Publicly listening' in log_path.read_text(errors='replace'):
+                    if 'Server spawned.' in log_path.read_text(errors='replace'):
                         break
                     await asyncio.sleep(0.05)
                 else:
@@ -171,6 +172,8 @@ async def playback(args, root):
 
 async def main(args):
     client.CON = mock.Mock()
+    client.cvar_system = client.CvarSystem()
+    client.register_download_cvars(client)
     with mock.patch.object(client, '_autosave_config'):
         for version, mask in ((15, 104), (666, 104), (999, 104), (666, 8), (666, 40), (666, 0)):
             await verify(args, version, mask)

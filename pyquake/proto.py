@@ -155,6 +155,7 @@ class ServerMessageType(enum.Enum):
     SPAWNBASELINE2 = 42
     SPAWNSTATIC2 = 43
     SPAWNSTATICSOUND2 = 44
+    DOWNLOADDATA = 50  # QSS-M/DarkPlaces legacy asset transfer
     UPDATESTATBYTE = 51
     PRECACHE = 54
     DP_SPAWNSTATICSOUND = 59
@@ -471,6 +472,19 @@ class StructServerMessage(ServerMessage):
     def parse(cls, m, protocol):
         vals, m = cls._parse_struct(cls.fmt, m)
         return cls(**dict(zip(cls.field_names, vals))), m
+
+
+@_register_server_message
+class ServerMessageDownloadData(ServerMessage):
+    field_names = ('offset', 'data')
+    msg_type = ServerMessageType.DOWNLOADDATA
+
+    @classmethod
+    def parse(cls, m, protocol):
+        (offset, size), m = cls._parse_struct("<IH", m)
+        if len(m) < size:
+            raise MalformedNetworkData("Truncated download data")
+        return cls(offset, m[:size]), m[size:]
 
 
 class ServerMessageUpdate(ServerMessage):

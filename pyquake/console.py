@@ -4,6 +4,7 @@ import asyncio
 import ctypes
 import fnmatch
 import inspect
+import json
 import os
 from pathlib import Path
 import re
@@ -29,15 +30,21 @@ SERVER_COMMANDS = frozenset({
 class ConsoleSession:
     def __init__(self, api):
         self.api = api
+        api.register_download_cvars(api)
         self.cvars = api.cvar_system
+        self._offline_downloads = api.DownloadManager(None, self.cvars, api.CON.write)
         self.aliases = self.cvars.command_aliases
         self.last_connect_spec = None
         self.tasks = ()
         self.demo = None
         self.demo_path = Path("pyquake.dem")
         self._demo_reader = None
+        self._demo_save_task = None
+        self._demo_save_lock = asyncio.Lock()
         self.enable_demo = False
         self._auto_demo_count = 0
+        self._demo_automatic = False
+        self._demo_map = ""
         self.connecting = False
         self.iplog = IpLog(Path(self.cvars._config_file).expanduser().resolve().parent / "iplog.dat")
         try:
@@ -56,6 +63,19 @@ class ConsoleSession:
                                              cvar_type=kind, minimum=0,
                                              maximum=3 if name == "cl_chatmode" else 1,
                                              description=description))
+        for name, value, kind, flags, minimum, maximum, description in (
+            ("cl_autodemo", "0", api.CvarType.INT, api.CvarFlags.ARCHIVE, 0, 4,
+             "0=off, 1=all maps, 2=matches, 3=multiplayer maps, 4=maps with cuts"),
+            ("cl_demo_minframes", "0", api.CvarType.INT, api.CvarFlags.ARCHIVE, None, None,
+             "Negative values discard newly finished demos shorter than abs(value)"),
+            ("cl_recordingdemo", "", api.CvarType.STRING, api.CvarFlags.ROM, None, None,
+             "Current demo destination"),
+            ("cl_demo_format", "dem", api.CvarType.STRING, api.CvarFlags.ARCHIVE, None, None,
+             "Recording format: dem or dz"),
+        ):
+            if self.cvars.find(name) is None:
+                self.cvars.register(api.Cvar(name, value, flags, cvar_type=kind,
+                                             minimum=minimum, maximum=maximum, description=description))
         self.dispatcher = CommandDispatcher(
             aliases=self.aliases, handle=self.handle, forward=self.forward,
             is_command=self.is_command, chat_mode=self.chat_mode,
@@ -94,6 +114,7 @@ class ConsoleSession:
         q = self.api
         if save:
             q._autosave_config(silent=True)
+        await self._offline_downloads.close()
         await q._stop_tasks(*self.tasks)
         self.tasks = ()
         old = self.client
@@ -103,50 +124,180 @@ class ConsoleSession:
             self._demo_reader = None
         if old is not None:
             await old.disconnect()
-        self.stop_demo()
+        if self._demo_save_task is not None:
+            await self._demo_save_task
+            self._demo_save_task = None
+        await self.stop_demo()
 
     def _start_demo(self, active):
-        self.demo = active.record_demo()
+        if self.cvars.get_string("cl_demo_format").lower() not in ("dem", "dz"):
+            self.api.CON.write("cl_demo_format must be dem or dz")
+            return False
+        try:
+            self.demo = active.record_demo(self.demo_path, on_error=self._demo_write_failed)
+        except OSError as exc:
+            self.api.CON.write(f"Could not start demo at {self.demo_path}: {exc}")
+            return False
+        self._demo_map = active.models[0].removeprefix("maps/").removesuffix(".bsp") if active.models else "unknown"
+        self.cvars.set_rom("cl_recordingdemo", "" if self.demo.write_error else str(self.demo_path))
         reader = active._read_task
         if reader is not None and reader is not self._demo_reader:
             self._demo_reader = reader
             reader.add_done_callback(self._demo_reader_finished)
+        return True
+
+    def _demo_write_failed(self, exc):
+        self.cvars.set_rom("cl_recordingdemo", "")
+        self.api.CON.write(f"Demo recording stopped after write failure: {exc}. "
+                           "Use stop to retry saving; the live connection continues.")
 
     def _demo_reader_finished(self, task):
         if task is self._demo_reader:
             self._demo_reader = None
-            self.stop_demo()
+            self._demo_save_task = asyncio.create_task(self.stop_demo())
 
-    def stop_demo(self):
+    async def stop_demo(self):
+        async with self._demo_save_lock:
+            return await self._stop_demo()
+
+    async def _stop_demo(self):
         if self.demo is None:
             return False
-        self.demo.stop_recording()
-        if not self.demo._msgs:
-            self.api.CON.write("No demo data received; no file saved.")
-            self.demo = None
-            return True
+        saved = False
+        cancelled = False
+        try:
+            self.demo.stop_recording()
+            if not self.demo.message_count:
+                self.demo.discard()
+                self.api.CON.write("No demo data received; no file saved.")
+            elif (self.cvars.get_value("cl_demo_minframes") < 0 and
+                  self.demo.message_count < abs(self.cvars.get_value("cl_demo_minframes"))):
+                self.demo.discard()
+                self.api.CON.write("Discarded short demo (cl_demo_minframes).")
+            else:
+                if self.demo_path.suffix.lower() == ".dz":
+                    demo, path = self.demo, self.demo_path
+                    def publish():
+                        try:
+                            demo.publish(path)
+                            return None
+                        except OSError as exc:
+                            return exc
+                    worker = asyncio.get_running_loop().run_in_executor(None, publish)
+                    while True:
+                        try:
+                            error = await asyncio.shield(worker)
+                            break
+                        except asyncio.CancelledError:
+                            # Complete the one writer before another stop or
+                            # disconnect can retry the same recovery file.
+                            cancelled = True
+                    if error is not None:
+                        raise error
+                else:
+                    self.demo.publish(self.demo_path)
+                saved = True
+                self.api.CON.write(f"Demo saved to {self.demo_path}")
+                if self.demo.cleanup_warning is not None:
+                    self.api.CON.write(self.demo.cleanup_warning)
+        except OSError as exc:
+            self.cvars.set_rom("cl_recordingdemo", "")
+            self.api.CON.write(f"Could not save demo to {self.demo_path}: {exc}. Use stop to retry. "
+                               f"Recovery file: {self.demo.recovery_path}")
+            if cancelled:
+                raise asyncio.CancelledError
+            return False
+        if saved:
+            self._save_demo_marks(self.demo)
+        self.demo = None
+        self._demo_automatic = False
+        self.cvars.set_rom("cl_recordingdemo", "")
+        if cancelled:
+            raise asyncio.CancelledError
+        return True
+
+    def _new_demo_path(self):
+        directory = Path("demos")
+        directory.mkdir(exist_ok=True)
+        active = self.client
+        name = active.models[0] if active and active.models else "unknown"
+        name = re.sub(r"[^a-zA-Z0-9_-]", "_", name.rsplit("/", 1)[-1].removesuffix(".bsp"))
+        stem = name + "_" + time.strftime("%m-%d-%Y-%H%M%S")
+        extension = ".dz" if self.cvars.get_string("cl_demo_format").lower() == "dz" else ".dem"
+        index = 1
+        while True:
+            suffix = "" if index == 1 else f"_{index}"
+            path = directory / (stem + suffix + extension)
+            if not path.exists() and not any(directory.glob(path.stem + ".recording-*.dem")):
+                return path
+            index += 1
+
+    async def _demo_event(self, active, event, value):
+        if self.client is not active:
+            return
+        mode = int(self.cvars.get_value("cl_autodemo"))
+        if event == "map":
+            if self.demo is not None and self._demo_automatic:
+                await self.stop_demo()
+            return
+        spawned, prints = value
+        start = spawned and (mode in (1, 4) or (mode == 3 and self.client.game_type == 1))
+        for text in prints:
+            # Chat cannot start/stop recording by quoting match announcements.
+            if text.startswith("\x01"):
+                continue
+            text = text.strip()
+            if mode == 2:
+                if text == "The match is over":
+                    start = False
+                    if self.demo is not None and self._demo_automatic:
+                        await self.stop_demo()
+                elif text.startswith("The match has begun!") or re.fullmatch(r"\d+ minutes? remaining", text):
+                    start = True
+        if start and self.demo is None and not self.client.disconnected:
+            try:
+                self.demo_path = self._new_demo_path()
+            except OSError as exc:
+                self.api.CON.write(f"Could not create demos directory: {exc}")
+                return
+            self._demo_automatic = self._start_demo(self.client)
+            if self.demo is not None:
+                self.api.CON.write(f"Demo recording started: {self.demo_path}")
+
+    def _marks_path(self):
+        return Path(self.cvars._config_file).expanduser().resolve().parent / "demomarks.json"
+
+    def _save_demo_marks(self, demo):
+        path = self._marks_path()
         temporary = None
         try:
-            # Publish only a complete file, keeping any previous demo intact
-            # if writing or closing the replacement fails.
-            with tempfile.NamedTemporaryFile(mode="wb", dir=self.demo_path.parent,
-                                             prefix=".pyquake-demo-",
-                                             suffix=".tmp", delete=False) as output:
+            if not demo.markers and not path.exists():
+                return
+            entries = json.loads(path.read_text()) if path.exists() else []
+            if not isinstance(entries, list) or any(not isinstance(entry, dict) for entry in entries):
+                raise ValueError("expected a list of marker entries")
+            destination = self.demo_path.resolve()
+            entries = [entry for entry in entries
+                       if not isinstance(entry.get("demo"), str) or Path(entry["demo"]).resolve() != destination]
+            entries.extend({"demo": str(destination),
+                            "map": demo.marker_info.get(frame, {}).get("map", self._demo_map),
+                            "frame": frame,
+                            "created_at": demo.marker_info.get(frame, {}).get("created_at", time.strftime("%Y-%m-%d %H:%M:%S"))}
+                           for frame in demo.markers)
+            with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, prefix=".demomarks-",
+                                             delete=False, encoding="utf-8") as output:
                 temporary = Path(output.name)
-                self.demo.dump(output)
-            os.replace(temporary, self.demo_path)
-        except OSError as exc:
-            self.api.CON.write(f"Could not save demo to {self.demo_path}: {exc}. Use stop to retry.")
-            return False
+                json.dump(entries, output, indent=2)
+                output.write("\n")
+            os.replace(temporary, path)
+        except (OSError, ValueError) as exc:
+            self.api.CON.write(f"Could not save demo marker history: {exc}")
         finally:
             if temporary is not None:
                 try:
                     temporary.unlink(missing_ok=True)
                 except OSError:
                     pass
-        self.api.CON.write(f"Demo saved to {self.demo_path}")
-        self.demo = None
-        return True
 
     async def connect(self, spec, *, spawn_timeout=20):
         if self.connecting:
@@ -178,9 +329,13 @@ class ConsoleSession:
         active._bind_cvar_subscriptions()
         q._set_current_client(active)
         if self.enable_demo and self.demo is None:
-            self._auto_demo_count += 1
-            suffix = "" if self._auto_demo_count == 1 else f"_{self._auto_demo_count}"
-            self.demo_path = Path(f"pyquake{suffix}.dem")
+            extension = ".dz" if self.cvars.get_string("cl_demo_format").lower() == "dz" else ".dem"
+            while True:
+                self._auto_demo_count += 1
+                suffix = "" if self._auto_demo_count == 1 else f"_{self._auto_demo_count}"
+                self.demo_path = Path(f"pyquake{suffix}" + extension)
+                if not self.demo_path.exists() and not any(self.demo_path.parent.glob(self.demo_path.stem + ".recording-*.dem")):
+                    break
             self._start_demo(active)
         self.tasks = tuple(asyncio.create_task(fn(active)) for fn in (
             q._simple_keep_alive, q._watch_chatinfo, q._kickstart_handshake, q._connection_guard))
@@ -273,11 +428,17 @@ class ConsoleSession:
             if self.demo is not None:
                 q.CON.write("A demo is already pending; use stop to save it first.")
             elif self.client is not None and not self.client.disconnected:
-                self.demo_path = Path(args[0] if args else "pyquake.dem")
-                if self.demo_path.suffix.lower() != ".dem":
-                    self.demo_path = Path(str(self.demo_path) + ".dem")
-                self._start_demo(self.client)
-                q.CON.write("Demo recording started")
+                try:
+                    self.demo_path = Path(args[0]) if args else self._new_demo_path()
+                except OSError as exc:
+                    q.CON.write(f"Could not create demos directory: {exc}")
+                    return True
+                if self.demo_path.suffix.lower() not in (".dem", ".dz"):
+                    extension = ".dz" if self.cvars.get_string("cl_demo_format").lower() == "dz" else ".dem"
+                    self.demo_path = Path(str(self.demo_path) + extension)
+                if self._start_demo(self.client):
+                    self._demo_automatic = False
+                    q.CON.write(f"Demo recording started: {self.demo_path}")
             else:
                 q.CON.write("Not connected.")
         elif name == "stop":
@@ -286,7 +447,63 @@ class ConsoleSession:
             elif self.demo is None:
                 q.CON.write("Not recording a demo.")
             else:
-                self.stop_demo()
+                await self.stop_demo()
+        elif name == "markdemo":
+            if args:
+                q.CON.write("Usage: markdemo")
+            elif self.demo is not None:
+                active = self.client
+                map_name = active.models[0].removeprefix("maps/").removesuffix(".bsp") if active and active.models else self._demo_map
+                frame = self.demo.mark(map_name)
+                q.CON.write(f"Demo marker added at frame {frame}" if frame is not None
+                            else "Demo has not started or recording stopped after a write failure.")
+            else:
+                try:
+                    entries = json.loads(self._marks_path().read_text())
+                    for entry in entries:
+                        q.CON.write(f"{entry['demo']} frame {entry['frame']} ({entry['map']})")
+                    if not entries:
+                        q.CON.write("No saved demo markers.")
+                except FileNotFoundError:
+                    q.CON.write("No saved demo markers.")
+                except (OSError, ValueError, TypeError, KeyError) as exc:
+                    q.CON.write(f"Could not read demo marker history: {exc}")
+        elif name == "recoverdemo":
+            if len(args) != 2:
+                q.CON.write("Usage: recoverdemo <recovery.dem> <destination.dem>")
+            else:
+                source, destination = (Path(arg) for arg in args)
+                live = self.demo.recovery_path if self.demo is not None else None
+                if live is not None and live.resolve() in (source.resolve(), destination.resolve()):
+                    q.CON.write("Use stop to finish the current recording before recovering it.")
+                elif destination.suffix.lower() != ".dem":
+                    q.CON.write("Recovery destination must end in .dem")
+                else:
+                    try:
+                        count = q.recover_demo(source, destination)
+                        q.CON.write(f"Recovered {count} demo records to {destination}")
+                    except (OSError, ValueError) as exc:
+                        q.CON.write(f"Could not recover demo: {exc}")
+        elif name == "download":
+            manager = self.client.downloads if self.client and not self.client.disconnected else self._offline_downloads
+            if not args and manager.busy:
+                q.CON.write(f"Downloading {manager.name} from {manager.source}: {manager.received}/{manager.total} bytes")
+            elif not 1 <= len(args) <= 2:
+                q.CON.write("Usage: download <asset> [auto|web|server]")
+            else:
+                try:
+                    manager.start(args[0], args[1].lower() if len(args) == 2 else "auto")
+                except (ValueError, OSError, q.DownloadError) as exc:
+                    q.CON.write(f"Could not start download: {exc}")
+        elif name == "stopdownload":
+            if args:
+                q.CON.write("Usage: stopdownload")
+            else:
+                manager = self.client.downloads if self.client and not self.client.disconnected else self._offline_downloads
+                if manager.busy:
+                    manager.cancel(resume_signon=True)
+                else:
+                    q.CON.write("No download is active.")
         elif name in ("showscores", "scoreboard"):
             if self.client is None or self.client.disconnected:
                 q.CON.write("Not connected.")
@@ -342,6 +559,7 @@ class ConsoleSession:
         return True
 
     def _attach_iplog(self, active):
+        active._demo_event = lambda event, value: self._demo_event(active, event, value)
         for address, name in active.iplog.entries():
             self.iplog.add(address, name)
         active.iplog = self.iplog
@@ -552,6 +770,8 @@ class ConsoleSession:
         q = self.api
         await self.dispatcher.close()
         await self.disconnect()
+        if self.demo is not None:
+            self.demo.close()
         try:
             self.iplog.save()
         except (OSError, ValueError) as exc:

@@ -1,6 +1,8 @@
 import asyncio
+import json
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -25,6 +27,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         temporary = tempfile.TemporaryDirectory(prefix="pyquake-commands-", dir=Path(__file__).resolve().parents[1])
         self.addCleanup(temporary.cleanup)
         self.directory = Path(temporary.name)
+        self.cvars._config_file = str(self.directory / "config.cfg")
         self.conn = FakeConnection()
         self.active = client.AsyncClient(self.conn)
         self.active._spawned_fut.set_result(None)
@@ -71,14 +74,14 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(path.read_bytes(), b"existing recording")
         self.assertIsNone(self.session.demo)
 
-    async def test_demo_save_failure_preserves_recording_for_retry(self):
+    async def test_demo_missing_directory_fails_before_recording_starts(self):
         path = self.directory / "missing" / "match.dem"
         await self.execute(f"record {quote_arg(path)}")
-        self.session.demo.add_message((0, 0, 0), server_info(), True)
-        await self.execute("stop")
-        self.assertIsNotNone(self.session.demo)
-        self.assertTrue(any("Could not save demo" in line for line in self.output()))
+        self.assertIsNone(self.session.demo)
+        self.assertTrue(any("Could not start demo" in line for line in self.output()))
         path.parent.mkdir()
+        await self.execute(f"record {quote_arg(path)}")
+        self.session.demo.add_message((0, 0, 0), server_info(), True)
         await self.execute("stop")
         self.assertIsNone(self.session.demo)
         self.assertTrue(path.read_bytes().endswith(b"\x02"))
@@ -90,15 +93,11 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         demo = self.session.demo
         demo.add_message((0, 0, 0), server_info(), True)
 
-        def failed_write(output):
-            output.write(b"partial data")
-            raise OSError("disk full")
-
-        with mock.patch.object(demo, "dump", side_effect=failed_write):
+        with mock.patch("pyquake.demo.os.fsync", side_effect=OSError("disk full")):
             await self.execute("stop")
         self.assertIs(self.session.demo, demo)
         self.assertEqual(path.read_bytes(), b"previous recording")
-        self.assertEqual(list(self.directory.iterdir()), [path])
+        self.assertEqual(set(self.directory.iterdir()), {path, demo.recovery_path})
         await self.execute("stop")
         self.assertIsNone(self.session.demo)
         with path.open("rb") as stream:
@@ -118,7 +117,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
             messages = list(proto.read_demo_file(stream))
         self.assertEqual(messages[-1][2].msg_type, proto.ServerMessageType.DISCONNECT)
 
-    async def test_demo_replace_failure_keeps_old_file_and_removes_temporary_file(self):
+    async def test_demo_replace_failure_keeps_old_file_and_recovery_file(self):
         path = self.directory / "match.dem"
         path.write_bytes(b"previous recording")
         await self.execute(f"record {quote_arg(path)}")
@@ -126,7 +125,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch("pyquake.console.os.replace", side_effect=PermissionError("file in use")):
             await self.execute("stop")
         self.assertEqual(path.read_bytes(), b"previous recording")
-        self.assertEqual(list(self.directory.iterdir()), [path])
+        self.assertEqual(set(self.directory.iterdir()), {path, self.session.demo.recovery_path})
         self.assertIsNotNone(self.session.demo)
         await self.execute("stop")
         self.assertIsNone(self.session.demo)
@@ -165,6 +164,251 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         await self.execute("stop")
         self.assertIsNone(self.session.demo)
         self.assertTrue(path.is_file())
+
+    async def test_markers_and_recording_status_survive_save(self):
+        path = self.directory / "marked.dem"
+        await self.execute(f"record {quote_arg(path)}")
+        self.assertEqual(self.cvars.get_string("cl_recordingdemo"), str(path))
+        await self.execute('cl_recordingdemo "cannot change"')
+        self.assertEqual(self.cvars.get_string("cl_recordingdemo"), str(path))
+        self.session.demo.add_message((0, 0, 0), server_info(), True)
+        await self.execute("markdemo; stop")
+        self.assertEqual(self.cvars.get_string("cl_recordingdemo"), "")
+        entries = json.loads((self.directory / "demomarks.json").read_text())
+        self.assertEqual(entries[0]["demo"], str(path))
+        with path.open("rb") as stream:
+            messages = list(proto.read_demo_file(stream))
+        self.assertEqual(messages[1][2].string, "//demomark\n")
+        self.assertEqual(entries[0]["frame"], 2)
+        await self.execute("cl_chatmode 1; markdemo")
+        self.assertEqual(self.messages(), [])
+        self.assertTrue(any(str(path) in line and "frame 2" in line for line in self.output()))
+
+    async def test_short_demo_discard_preserves_old_destination(self):
+        path = self.directory / "old.dem"
+        path.write_bytes(b"keep this demo")
+        await self.execute(f"cl_demo_minframes -10; record {quote_arg(path)}")
+        self.session.demo.add_message((0, 0, 0), server_info(), True)
+        await self.execute("markdemo; stop")
+        self.assertEqual(path.read_bytes(), b"keep this demo")
+        self.assertFalse((self.directory / "demomarks.json").exists())
+        self.assertEqual(list(self.directory.iterdir()), [path])
+
+    async def test_automatic_map_recordings_split_at_serverinfo(self):
+        self.active._read_task = asyncio.create_task(self.active._read_messages())
+        self.active._read_task.add_done_callback(self.active._reader_finished)
+        paths = [self.directory / "first.dem", self.directory / "second.dem"]
+        await self.execute("cl_autodemo 1")
+        with mock.patch.object(self.session, "_new_demo_path", side_effect=paths):
+            self.conn.incoming.put_nowait(server_info(level=b"first") + b"\x19\x03")
+            for _ in range(5):
+                await asyncio.sleep(0)
+            first = self.session.demo
+            self.assertIsNotNone(first)
+            self.conn.incoming.put_nowait(server_info(level=b"second") + b"\x19\x03")
+            for _ in range(5):
+                await asyncio.sleep(0)
+            self.assertIsNot(self.session.demo, first)
+            await self.execute("stop")
+        for path, level in zip(paths, ("first", "second")):
+            with path.open("rb") as stream:
+                messages = [m for _, _, m in proto.read_demo_file(stream)]
+            self.assertEqual([m.level_name for m in messages if m.msg_type == proto.ServerMessageType.SERVERINFO], [level])
+            self.assertEqual(messages[-1].msg_type, proto.ServerMessageType.DISCONNECT)
+
+    async def test_automatic_match_recording_ignores_chat_and_stops_on_match_end(self):
+        self.active._read_task = asyncio.create_task(self.active._read_messages())
+        self.active._read_task.add_done_callback(self.active._reader_finished)
+        await self.execute("cl_autodemo 2")
+        path = self.directory / "match.dem"
+        with mock.patch.object(self.session, "_new_demo_path", return_value=path):
+            for payload in (server_info() + b"\x19\x03", b"\x08\x01The match has begun!\n\0"):
+                self.conn.incoming.put_nowait(payload)
+                for _ in range(5):
+                    await asyncio.sleep(0)
+            self.assertIsNone(self.session.demo)
+            self.conn.incoming.put_nowait(b"\x08The match has begun!\n\0")
+            for _ in range(5):
+                await asyncio.sleep(0)
+            self.assertIsNotNone(self.session.demo)
+            self.conn.incoming.put_nowait(b"\x08\x01The match is over\n\0")
+            for _ in range(5):
+                await asyncio.sleep(0)
+            self.assertIsNotNone(self.session.demo)
+            self.conn.incoming.put_nowait(b"\x08The match is over\n\0")
+            for _ in range(5):
+                await asyncio.sleep(0)
+            self.assertIsNone(self.session.demo)
+        self.assertTrue(path.is_file())
+
+    async def test_default_name_is_timestamped_and_avoids_existing_recovery_files(self):
+        self.active.models = ["maps/dm3.bsp"]
+        with mock.patch("pyquake.console.Path", side_effect=lambda name: self.directory / name), \
+                mock.patch("pyquake.console.time.strftime", return_value="10-14-2026-123000"):
+            first = self.session._new_demo_path()
+            (first.parent / (first.stem + ".recording-crash.dem")).touch()
+            second = self.session._new_demo_path()
+            self.assertNotEqual(first, second)
+            self.assertEqual(second.name, "dm3_10-14-2026-123000_2.dem")
+            first.touch()
+            (second.parent / (second.stem + ".recording-crash.dem")).touch()
+            third = self.session._new_demo_path()
+            self.assertEqual(third.name, "dm3_10-14-2026-123000_3.dem")
+
+    async def test_marker_history_tracks_map_at_each_marker(self):
+        path = self.directory / "maps.dem"
+        self.active.models = ["maps/dm3.bsp"]
+        await self.execute(f"record {quote_arg(path)}")
+        self.session.demo.add_message((0, 0, 0), server_info(), True)
+        await self.execute("markdemo")
+        self.active.models = ["maps/dm6.bsp"]
+        await self.execute("markdemo; stop")
+        entries = json.loads((self.directory / "demomarks.json").read_text())
+        self.assertEqual([entry["map"] for entry in entries], ["dm3", "dm6"])
+
+    async def test_recoverdemo_is_local_and_refuses_the_active_recovery_file(self):
+        path = self.directory / "match.dem"
+        recovered = self.directory / "recovered.dem"
+        await self.execute(f"cl_chatmode 1; record {quote_arg(path)}")
+        self.session.demo.add_message((0, 0, 0), server_info(), True)
+        recovery = self.session.demo.recovery_path
+        await self.execute(f"recoverdemo {quote_arg(recovery)} {quote_arg(recovered)}")
+        self.assertFalse(recovered.exists())
+        self.session.demo.close()
+        self.session.demo = None  # Model a recording left by a terminated process.
+        await self.execute(f"recoverdemo {quote_arg(recovery)} {quote_arg(recovered)}")
+        self.assertEqual(self.messages(), [])
+        self.assertTrue(recovery.exists())
+        with recovered.open("rb") as stream:
+            messages = list(proto.read_demo_file(stream))
+        self.assertEqual(messages[-1][2].msg_type, proto.ServerMessageType.DISCONNECT)
+        # The original client still owns the unfinished object; dispose it after
+        # verifying recovery rather than having teardown finish that simulation.
+        self.active._demos[0].discard()
+
+    async def test_dzip_format_is_selected_before_recording(self):
+        path = self.directory / "compressed"
+        await self.execute(f"cl_demo_format dz; record {quote_arg(path)}")
+        self.session.demo.add_message((0, 0, 0), server_info(), True)
+        await self.execute("stop")
+        self.assertEqual(path.with_suffix(".dz").read_bytes()[:4], b"DZ\x03\x02")
+
+    async def test_dzip_finalization_keeps_the_receive_loop_responsive(self):
+        path = self.directory / "responsive.dz"
+        await self.execute(f"record {quote_arg(path)}")
+        demo = self.session.demo
+        demo.add_message((0, 0, 0), server_info(), True)
+        started, release = threading.Event(), threading.Event()
+        publish = demo.publish
+        def slow_publish(path):
+            started.set()
+            release.wait(2)
+            publish(path)
+        self.active._read_task = asyncio.create_task(self.active._read_messages())
+        self.active._read_task.add_done_callback(self.active._reader_finished)
+        with mock.patch.object(demo, "publish", side_effect=slow_publish):
+            stopping = asyncio.create_task(self.execute("stop"))
+            try:
+                await asyncio.wait_for(asyncio.to_thread(started.wait), 3)
+                self.assertFalse(stopping.done())
+                waiting = asyncio.create_task(self.active.wait_for_center_print())
+                await asyncio.sleep(0)
+                self.conn.incoming.put_nowait(b"\x1astill receiving\0")
+                self.assertEqual(await asyncio.wait_for(waiting, .5), "still receiving")
+            finally:
+                release.set()
+                await stopping
+        self.assertTrue(path.exists())
+
+    async def test_overwriting_demo_clears_its_old_marker_history_only_after_save(self):
+        path = self.directory / "repeat.dem"
+        await self.execute(f"record {quote_arg(path)}")
+        self.session.demo.add_message((0, 0, 0), server_info(), True)
+        await self.execute("markdemo; stop")
+        await self.execute(f"record {quote_arg(path)}")
+        self.session.demo.add_message((0, 0, 0), server_info(), True)
+        with mock.patch("pyquake.demo.os.replace", side_effect=OSError("cannot publish")):
+            await self.execute("stop")
+        self.assertEqual(len(json.loads((self.directory / "demomarks.json").read_text())), 1)
+        await self.execute("stop")
+        self.assertEqual(json.loads((self.directory / "demomarks.json").read_text()), [])
+
+    async def test_cancelling_dzip_save_waits_for_the_writer_before_releasing_demo(self):
+        path = self.directory / "cancelled-save.dz"
+        await self.execute(f"record {quote_arg(path)}")
+        demo = self.session.demo
+        demo.add_message((0, 0, 0), server_info(), True)
+        started, release = threading.Event(), threading.Event()
+        publish = demo.publish
+        def slow_publish(path):
+            started.set()
+            release.wait(2)
+            publish(path)
+        with mock.patch.object(demo, "publish", side_effect=slow_publish) as writer:
+            saving = asyncio.create_task(self.session.stop_demo())
+            await asyncio.wait_for(asyncio.to_thread(started.wait), 3)
+            saving.cancel()
+            await asyncio.sleep(0)
+            saving.cancel()
+            await asyncio.sleep(0)
+            retry = asyncio.create_task(self.session.stop_demo())
+            try:
+                self.assertFalse(saving.done())
+                self.assertFalse(retry.done())
+            finally:
+                release.set()
+                await asyncio.gather(saving, retry, return_exceptions=True)
+            self.assertTrue(saving.cancelled())
+            self.assertEqual(writer.call_count, 1)
+        self.assertIsNone(self.session.demo)
+        self.assertTrue(path.exists())
+
+    async def test_shutdown_cancellation_still_finishes_the_archive(self):
+        path = self.directory / "shutdown.dz"
+        await self.execute(f"record {quote_arg(path)}")
+        demo = self.session.demo
+        demo.add_message((0, 0, 0), server_info(), True)
+        started, release = threading.Event(), threading.Event()
+        publish = demo.publish
+        def slow_publish(path):
+            started.set()
+            release.wait(2)
+            publish(path)
+        before = asyncio.all_tasks()
+        with mock.patch.object(demo, "publish", side_effect=slow_publish):
+            saving = asyncio.create_task(self.session.stop_demo())
+            await asyncio.wait_for(asyncio.to_thread(started.wait), 3)
+            shutdown_tasks = asyncio.all_tasks() - before
+            for task in shutdown_tasks:
+                task.cancel()
+            release.set()
+            await asyncio.wait_for(asyncio.gather(*shutdown_tasks, return_exceptions=True), 2)
+            self.assertTrue(saving.cancelled())
+        self.assertIsNone(self.session.demo)
+        self.assertTrue(path.exists())
+
+    async def test_download_commands_are_local_and_use_selected_source(self):
+        await self.execute("cl_chatmode 1")
+        with mock.patch.object(self.active.downloads, "start") as start:
+            await self.execute("download dm3.bsp server")
+        start.assert_called_once_with("dm3.bsp", "server")
+        self.assertEqual(self.messages(), [])
+        await self.execute("allow_download 0; download dm3.bsp web")
+        self.assertTrue(any("downloads disabled" in line for line in self.output()))
+        self.assertEqual(self.messages(), [])
+
+    async def test_offline_web_download_and_stop_route_to_offline_manager(self):
+        await self.session.disconnect()
+        manager = self.session._offline_downloads
+        with mock.patch.object(manager, "start") as start:
+            await self.execute("cl_chatmode 1; download dm3.loc web")
+        start.assert_called_once_with("dm3.loc", "web")
+        manager.task = asyncio.create_task(asyncio.Event().wait())
+        with mock.patch.object(manager, "cancel", wraps=manager.cancel) as cancel:
+            await self.execute("stopdownload")
+            cancel.assert_called_once_with(resume_signon=True)
+        await asyncio.gather(manager.task, return_exceptions=True)
+        self.assertEqual(self.messages(), [])
 
     async def test_auto_chat_keeps_commands_cvars_and_aliases(self):
         await self.execute('cl_chatmode 1; seta greeting hello; alias go "ready"')

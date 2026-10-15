@@ -6,3 +6,6 @@ __pycache__/
 # Local player identity history
 iplog.dat
 iplog.txt
+
+# Local integration-test artifacts
+.build/

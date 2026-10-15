@@ -11,7 +11,7 @@ commands from your terminal.
 **Python 3.10+ · Standard library only · MIT licensed**
 
 [Get connected](#get-connected) · [Console reference](#console-reference) ·
-[Record demos](#record-demos) · [Protocol support](#protocol-support) ·
+[Record demos](#record-demos) · [Download assets](#download-assets) · [Protocol support](#protocol-support) ·
 [Development](#development)
 
 ## What you can do
@@ -152,24 +152,93 @@ record match
 stop
 ```
 
-`record match` writes `match.dem`; `demo match` is an alias for the same command.
-Omit the filename to use `pyquake.dem`, or quote filenames containing spaces:
+While connected, use `record match` (or `demo match`) to start recording to
+`match.dem`, then `stop` to save it. Without a filename, `record` creates
+`demos/map_MM-DD-YYYY-HHMMSS.dem`, adding a numeric suffix if needed. Quote
+filenames containing spaces. Manual recording can start mid-map and continues
+across map changes. Disconnecting or quitting also saves it.
+With `--demo`, reconnecting starts a new file (`pyquake_2.dem`, and so on).
+Play the saved file in QSS-M with `playdemo match` after copying it into the
+game's demo search path; install the corresponding maps and mod assets there too.
+
+Console recordings write packets to a `name.recording-*.dem` recovery file beside
+the destination as they arrive, without keeping the whole recording in memory.
+`stop` finishes the file and replaces the destination only after a successful
+save. A failed write stops capture without disconnecting the client; `stop`
+retries saving the captured prefix. After a crash, use
+`recoverdemo "name.recording-ABC.dem" "recovered.dem"` to copy complete packets
+into a playable file. The recovery command leaves the source untouched.
+
+Mid-map recording restores current scoreboard, lightstyles, stats, view, pause,
+fog, info strings, ProQuake teams/clock, and late static entities/sounds. Ordinary
+gameplay then follows the incoming server packets.
 
 ```text
-record "practice session"
+cl_autodemo 1         // record each map into its own timestamped file
+cl_autodemo 2         // start/end on server match announcements
+cl_autodemo 3         // automatic maps for multiplayer games only
+cl_autodemo 4         // record maps with cuts on reload/change
+cl_autodemo 0         // disable automatic recording
+cl_demo_format dz    // compress completed recordings as QSS-M-compatible DZip
+cl_demo_format dem   // use raw .dem output (default)
+markdemo             // add a QSS-M-compatible marker; offline, list saved marks
+cl_recordingdemo     // read-only current recording destination
+cl_demo_minframes -100 // discard newly finished recordings under 100 records
 ```
 
-Recording can begin mid-map and continues across map changes. `stop`, disconnecting,
-or quitting saves the file. With `--demo`, reconnecting starts a new file:
-`pyquake_2.dem`, `pyquake_3.dem`, and so on.
+`markdemo` saves history to `demomarks.json` beside the config file. Replacing a
+demo clears its old marker entries only after the new file saves successfully.
+DZip finalization runs in a worker so receiving and keepalives continue during
+compression. Short-demo discarding preserves any existing destination. Positive `cl_demo_minframes`
+values retain files; this console client has no demo browser to filter.
+Automatic recordings split at map boundaries, including reloads of the same map.
+Match automation ignores marked chat messages quoting server announcements.
+Protocol negotiation also supports the FTE extensions described below.
 
-Copy the demo into QSS-M's demo search path, then run this in its console:
+Programmatic clients can call `record_demo(path)` for disk recording, then
+`stop_recording()` and `publish(path)`. Calling `record_demo()` without a path
+retains the existing in-memory API and `dump()` angle-calculator support.
+
+## Download assets
+
+Missing precached maps, models, and sounds download automatically before
+`prespawn`. The client checks loose files and `.pak` directories first, tries
+the configured web mirrors, then falls back to the connected server when it
+advertises QSS-M legacy downloads. The receive loop and connection keepalives
+continue during transfers. Missing or refused files are reported and sign-on
+continues; this client does not need rendering assets to stay connected.
 
 ```text
-playdemo match
+cl_download_dir "id1"              // destination game directory, relative to cwd
+cl_download_searchpath "/path/to/quake/id1" // additional installed game directories
+download ultrav.bsp                // try web mirrors, then the connected server
+download maps/ultrav.bsp server     // server only
+download dm3.loc web               // web only; works offline too
+download                          // show an active transfer's progress
+stopdownload                      // cancel; partial files are discarded
+cl_download_auto 0                 // disable automatic downloads, keep manual ones
+allow_download 0                   // disable both automatic and manual downloads
 ```
 
-Install the matching maps and mod assets in QSS-M before playback.
+`cl_download_dir` defaults to `id1` in the current directory. Set it to the game
+directory you want QSS-M to use for playback, or copy downloaded assets there.
+`cl_download_searchpath` uses the OS path separator (`:` on Linux/macOS, `;` on
+Windows) between additional directories; include a mod's `id1` directory there
+to reuse base-game PAKs. Inline models such as `*1` are never requested.
+
+Web mirrors use `cl_web_download_url` and `cl_web_download_url2`, defaulting to
+Q1Tools (`q1tools/q1tools.github.io`) and `maps.quakeworld.nu`. Use an HTTP(S)
+base URL for a mirror with paths such as `maps/name.bsp`, or a GitHub
+`user/repo[/branch]` value for QSS-M's letter-bucket map layout. Set either
+variable to `""` to disable that mirror. Only configured mirrors are used;
+servers cannot choose a web URL or filesystem destination.
+
+Downloads are limited by `cl_download_maxsize` (50 MiB by default) and
+`cl_download_timeout` (15 seconds without progress). Completed server transfers
+must match the announced size and CRC. Files publish only after verification,
+and existing installed assets are preserved. Download control messages and file
+data are excluded from demos. This implements the legacy server path; chunked
+download extensions and full mod/package installation are not negotiated.
 
 ## Protocol support
 
@@ -191,7 +260,8 @@ include the state needed to start playback after joining a map.
 Negotiation is automatic. The protocol banner reflects what the server actually
 selected: for example, `666` for base FitzQuake or `fte666` with negotiated
 extensions. Servers without the negotiated extensions use their base protocol.
-CSQC, downloads, voice, and cursor extensions are not advertised.
+CSQC, chunked download, voice, and cursor extensions are not advertised.
+Legacy server downloads work independently of the FTE download extensions.
 
 ## Player identity history
 
@@ -307,6 +377,26 @@ packets. It covers protocols `15`, `666`, and `999` with `PEXT2 0x68`, plus prot
 Add `--playback` to replay the generated demos in QSS-M using SDL offscreen
 rendering. That option requires a working offscreen OpenGL environment. Temporary
 server and demo files are removed when each run finishes.
+
+For an opt-in live check against an installed QSS-M engine and Quake assets:
+
+```bash
+python3 tests/check_qssm_demos.py --engine /path/to/quakespasm --assets /path/to/id1
+```
+
+This starts isolated local servers for protocols 15/666/999 and plays join,
+mid-map, DZip, and map-change recordings in QSS-M using SDL's offscreen driver.
+Logs and results stay under `.build/demo-parity/`.
+
+The download integration check uses isolated QSS-M and HTTP servers to verify
+server transfers, web transfers, fallback, sign-on, and playback of a demo
+recorded during downloads:
+
+```bash
+python3 tests/check_qssm_downloads.py --engine /path/to/quakespasm --assets /path/to/id1
+```
+
+Its files and results stay under `.build/downloads/`.
 
 ### Find your way around
 
