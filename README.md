@@ -139,6 +139,34 @@ columns. Set `con_coldirection 1` to fill rows from left to right instead;
 `0` (default) fills columns vertically. These settings also apply to the readline
 prompt when its completion display hook is available.
 
+Completion follows QSS-M's case-insensitive substring matching, with exact
+matches first, prefixes next, and natural name ordering (`item2` before `item10`).
+It uses the current command after a semicolon or newline and respects quoted
+arguments and comments. Both terminal prompts share the same suggestions.
+
+| Input | Tab suggestions |
+| --- | --- |
+| Command or cvar fragment | All matching built-ins, registered commands, cvars, cvar aliases, and command aliases. |
+| `connect ` | Saved server addresses. |
+| `reset ` / `toggle ` / `unset ` | Cvar names. |
+| `set ` / `seta ` | Non-archived cvar names, following QSS-M. |
+| `alias ` / `unalias ` / `aliasedit ` | Command aliases. |
+| `exec ` / `execconfig ` | Local `.cfg` files and directories. |
+| `writeconfig ` | Config files and a timestamped config filename. |
+| `tell ` / `dm ` / `pm ` / `identify ` | Connected player names; names with spaces are quoted. |
+| `color ` / `topcolor ` / `bottomcolor ` | Supported palette colors, `0` through `13`. |
+| `cl_chatmode ` / `cl_autodemo ` / `cl_demo_format ` / `cl_demo_minframes ` | QSS-M's supported setting values. |
+| `name ` | Current and previously used names, saved in `names.json` beside the config. |
+| `record ` / `demo ` | A timestamped name for the current map. |
+| `cmd ` / `rcon ` | Command names, followed by applicable argument suggestions. |
+| `download ` | Precached server assets; the next argument offers `auto`, `web`, and `server`. |
+
+Other cvars accept typed values without suggesting unrelated commands. Cvar
+value suggestions also work after `set`, `seta`, and `toggle`. Completion uses
+local files and client state; it does not perform network requests or create
+files. Graphics, sound playback, and other engine-only QSS-M commands are outside
+this console client's feature set.
+
 ### Choose your chat style
 
 The archived `cl_chatmode` variable follows QSS-M's console chat behavior:

@@ -8,6 +8,11 @@ import sys
 import threading
 import unicodedata
 
+if __package__:
+    from .completion import token_start
+else:
+    from completion import token_start
+
 
 RESET = "\x1b[0m"
 BACKGROUND = "\x1b[48;2;30;30;30m"
@@ -184,20 +189,21 @@ class TerminalInput:
 
     def _complete(self):
         before = self.text[:self.cursor]
-        start = len(before)
-        while start and before[start - 1] not in " \t\n;":
-            start -= 1
+        start = token_start(before)
         prefix = before[start:]
         candidates = self.complete(before[:start], prefix)
         if not candidates:
             return
         replacement = os.path.commonprefix(candidates)
-        if len(candidates) == 1:
+        if len(candidates) == 1 and not replacement.endswith("/"):
             replacement += " "
-        else:
+        elif len(candidates) > 1:
             # Show choices through the same output path used by server messages.
             sys.stdout.write(format_completions(candidates, self._size()[0],
                                                 *self.completion_options()))
+            # Substring matches can have no common prefix. Keep what was typed.
+            if not replacement.casefold().startswith(prefix.casefold()):
+                replacement = prefix
         self.text = self.text[:start] + replacement + self.text[self.cursor:]
         self.cursor = start + len(replacement)
 

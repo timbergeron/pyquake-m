@@ -9,6 +9,7 @@ iplog.txt
 
 # Local server connection history
 servers.json
+names.json
 
 # Local integration-test artifacts
 .build/

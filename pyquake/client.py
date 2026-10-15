@@ -63,6 +63,7 @@ if __package__:
     from .commands import define_alias, split_commands, quote_arg
     from .console import ConsoleSession, SERVER_COMMANDS, terminal_input_supported
     from .terminal_input import format_completions
+    from .completion import token_start
 else:
     from demo import Demo, recover_demo
     from downloads import DownloadError, DownloadManager, register_cvars as register_download_cvars
@@ -72,6 +73,7 @@ else:
     from commands import define_alias, split_commands, quote_arg
     from console import ConsoleSession, SERVER_COMMANDS, terminal_input_supported
     from terminal_input import format_completions
+    from completion import token_start
 from typing import Union
 
 # --- Windows UDP reliability: use SelectorEventLoop instead of Proactor ---
@@ -179,7 +181,7 @@ class Cvar:
                  cvar_type: CvarType = CvarType.FLOAT,
                  minimum: float | None = None,
                  maximum: float | None = None,
-                 description: str = ""):
+                 description: str = "", completion=None):
         self.name = name
         self._canon = name.lower()
         self.string = str(string_value)
@@ -191,6 +193,7 @@ class Cvar:
         self.minimum = minimum
         self.maximum = maximum
         self.description = description
+        self.completion = completion
         self._modified = False
         self.value = 0.0
         self._update_value()
@@ -288,6 +291,7 @@ class CvarSystem:
         self._cvars: dict[str, Cvar] = {}
         self._aliases: dict[str, str] = {}  # alias -> canonical name
         self._commands: dict[str, Callable] = {}
+        self._command_completions: dict[str, Callable] = {}
         self.command_aliases: dict[str, str] = {}
         self._config_file = "config.cfg"
         self._lock = threading.RLock()
@@ -550,11 +554,16 @@ class CvarSystem:
             return str(int(value))
         return f"{value:.6f}".rstrip('0').rstrip('.')
 
-    def register_command(self, name: str, func: Callable):
+    def register_command(self, name: str, func: Callable, *, completion=None):
         self._commands[self._canon(name)] = func
+        if completion is None:
+            self._command_completions.pop(self._canon(name), None)
+        else:
+            self._command_completions[self._canon(name)] = completion
 
     def unregister_command(self, name: str):
         self._commands.pop(self._canon(name), None)
+        self._command_completions.pop(self._canon(name), None)
 
     # --- NEW: support removing a CVAR cleanly ---
     def unregister_variable(self, name: str) -> bool:
@@ -1281,7 +1290,7 @@ def _split_queued_commands(s: str) -> list[str]:
 
 # Built-in client commands that shouldn't be shadowed; used for conflict rename.
 _RESERVED_CMDS = frozenset({
-    "help","cmdlist","aliaslist","clear","quit","exit","q","scoreboard","extip","disconnect","connect","reconnect","demo","record","stop","markdemo","recoverdemo","kill","status",
+    "help","cmdlist","alias","aliaslist","clear","quit","exit","q","scoreboard","extip","disconnect","connect","reconnect","demo","record","stop","markdemo","recoverdemo","kill","status",
     "players","showscores","ping","impulse","name","color","say","say_team","tell","dm","pm","like",
     "condump","echo","exec","ip","extip","port","random","cmd","rcon",
     "reset","resetall","resetcfg","s","st","net_stats","unalias","unaliasall","wait",
@@ -1355,67 +1364,6 @@ def _tabcomp__all_alias_names() -> list[str]:
     except NameError:
         return []
 
-def _startswith_ci(hay: str, needle: str) -> bool:
-    return hay.casefold().startswith((needle or "").casefold())
-
-def _tabcomp_candidates(prefix: str, *, mode: str, first_token: str|None) -> list[str]:
-    """
-    mode:
-      - "root": first token completion -> commands ∪ cvars ∪ aliases
-      - "cvar": second token completion for set/seta/toggle/reset/unset -> cvars
-      - "alias": second token completion for alias/unalias/aliasedit -> aliases
-      - "connect": server addresses from saved connection history
-    """
-    if mode == "none":
-        return []
-    if mode == "connect":
-        session = _get_console_session()
-        pool = [entry["address"] for entry in session.server_history]
-    elif mode == "cvar":
-        pool = _tabcomp__all_cvar_names()
-    elif mode == "alias":
-        pool = _tabcomp__all_alias_names()
-    else:
-        # root
-        pool = []
-        pool.extend(_tabcomp__all_command_names())
-        pool.extend(_tabcomp__all_cvar_names())
-        # prefer alias names last so commands/cvars appear first in duplicates
-        alias_names = _tabcomp__all_alias_names()
-        # De-dup while preserving earlier items' order
-        seen = set()
-        merged = []
-        for name in pool + alias_names:
-            k = name.casefold()
-            if k not in seen:
-                seen.add(k)
-                merged.append(name)
-        pool = merged
-    # Filter by prefix (case-insensitive)
-    return [n for n in pool if _startswith_ci(n, prefix)]
-
-def _tabcomp_mode_for_line(tokens: list[str]) -> str:
-    """
-    Decide which domain to complete based on the first token.
-    """
-    if not tokens:
-        return "root"
-    t0 = tokens[0].casefold()
-    if t0 == "connect":
-        return "connect" if len(tokens) == 1 else "none"
-    if t0 in ("set", "seta", "toggle", "reset", "unset"):
-        return "cvar"
-    if t0 in ("alias", "unalias", "aliasedit"):
-        return "alias"
-    return "root"
-
-def _clean_prompt_lead(buf: str) -> str:
-    # Our UI sometimes prints ']' before the cursor; ignore it for parsing.
-    # Only strip a single leading ']' so legit ']' in the command stays.
-    if buf.startswith("]"):
-        return buf[1:]
-    return buf
-
 def _tab_completer(text: str, state: int):
     """
     GNU readline-compatible completer:
@@ -1434,19 +1382,21 @@ def _tab_completer(text: str, state: int):
         beg = _readline.get_begidx()
     except Exception:
         beg = len(buf) - len(text)
-    line_up_to_cursor = _clean_prompt_lead(buf[:beg]).rsplit(";", 1)[-1]
-    # Split naively on whitespace (aliases are single bare names, fine)
-    tokens = [t for t in re.split(r"\s+", line_up_to_cursor.strip()) if t]
-    mode = _tabcomp_mode_for_line(tokens)
+    try:
+        end = _readline.get_endidx()
+    except Exception:
+        end = beg + len(text)
+    if not isinstance(end, int):
+        end = beg + len(text)
+    before = buf[:end]
+    start = token_start(before)
 
     # The prefix being completed is 'text'. Build cache key from context.
-    key = f"{mode}|{text}|{buf}|{beg}"
+    key = f"{text}|{buf}|{beg}|{end}"
     if state == 0 or key not in _TABCOMP_CACHE:
-        # When completing the second argument after e.g. 'set ', drop the first token from tokens.
-        prefix = text or ""
-        cand = _tabcomp_candidates(prefix, mode=mode, first_token=(tokens[0] if tokens else None))
-        # Sort with a mild heuristic: shorter first, then lexicographic (case-insensitive)
-        cand.sort(key=lambda s: (len(s), s.lower()))
+        cand = _get_console_session()._complete_input(before[:start], before[start:])
+        # Readline may start inside a quoted token containing spaces.
+        cand = [candidate[max(0, beg - start):] for candidate in cand]
         _TABCOMP_CACHE.clear()
         _TABCOMP_CACHE[key] = cand
     lst = _TABCOMP_CACHE.get(key, [])

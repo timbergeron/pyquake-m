@@ -69,7 +69,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(self.session._complete_input(context, "missing"), [])
         self.assertEqual(self.session._complete_input("connect denver.example:26000 ", ""), [])
         self.assertIn("connect", self.session._complete_input("", "con"))
-        self.assertIn("server_cvar", self.session._complete_input("set ", "server"))
+        self.assertIn("server_cvar", self.session._complete_input("reset ", "server"))
 
         editor = self.session._terminal_input
         editor.text = "connect oth"
@@ -852,7 +852,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_styled_completion_starts_a_new_command_after_semicolon(self):
         self.assertIn("status", self.session._complete_input("set name woods; ", "sta"))
-        self.assertIn("cl_chatmode", self.session._complete_input("set ", "cl_chat"))
+        self.assertIn("cl_chatmode", self.session._complete_input("reset ", "cl_chat"))
 
     async def test_chatmode_space_is_part_of_the_editable_input(self):
         readline = mock.Mock()

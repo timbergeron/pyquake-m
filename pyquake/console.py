@@ -14,10 +14,12 @@ import tempfile
 import time
 
 if __package__:
+    from .completion import complete as complete_input
     from .terminal_input import TerminalInput, supported as terminal_input_supported
     from .commands import CommandDispatcher, alias_key, define_alias, quote_arg, split_commands
     from .iplog import IpLog, address_prefix, format_address
 else:
+    from completion import complete as complete_input
     from terminal_input import TerminalInput, supported as terminal_input_supported
     from commands import CommandDispatcher, alias_key, define_alias, quote_arg, split_commands
     from iplog import IpLog, address_prefix, format_address
@@ -47,6 +49,25 @@ class ConsoleSession:
         self._server_history_writable = True
         self._load_server_history()
         self.last_connect_spec = self.server_history[0]["address"] if self.server_history else None
+        self.name_history = []
+        self._name_history_path = self._server_history_path.with_name("names.json")
+        self._name_history_writable = True
+        try:
+            entries = json.loads(self._name_history_path.read_text(encoding="utf-8"))
+            if not isinstance(entries, list):
+                raise ValueError("expected an array of names")
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                name = (bytes.fromhex(entry["name_hex"]).decode("latin-1")
+                        if isinstance(entry.get("name_hex"), str) else entry.get("name"))
+                if isinstance(name, str) and name and name not in self.name_history:
+                    self.name_history.append(name)
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as exc:
+            self._name_history_writable = False
+            api.CON.write(f"Could not read name history: {exc}")
         self.tasks = ()
         self.demo = None
         self.demo_path = Path("pyquake.dem")
@@ -98,6 +119,7 @@ class ConsoleSession:
             wait_frame=api._wait_next_frame, output=api.CON.write,
             reserved=lambda name: name in api._RESERVED_CMDS or name in self.cvars._commands,
             max_depth=api.ALIAS_MAX_DEPTH)
+        self.cvars.subscribe(self._remember_name)
 
     @property
     def client(self):
@@ -346,17 +368,29 @@ class ConsoleSession:
             entry for entry in self.server_history if entry["address"].casefold() != address.casefold()]
         if not self._server_history_writable:
             return
+        self._write_history(self._server_history_path, self.server_history, "server")
+
+    def _remember_name(self, variable, old, new):
+        if variable.name.casefold() != "name" or not new:
+            return
+        self.name_history = list(dict.fromkeys([new, old, *self.name_history]))
+        self.name_history = [name for name in self.name_history if name]
+        if self._name_history_writable:
+            self._write_history(self._name_history_path,
+                                [{"name": name} for name in self.name_history], "name")
+
+    def _write_history(self, path, entries, label):
         temporary = None
         try:
-            self._server_history_path.parent.mkdir(parents=True, exist_ok=True)
-            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=self._server_history_path.parent,
-                                             prefix=".servers-", delete=False) as output:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                             prefix=f".{path.stem}-", delete=False) as output:
                 temporary = Path(output.name)
-                json.dump(self.server_history, output, indent=2)
+                json.dump(entries, output, indent=2)
                 output.write("\n")
-            os.replace(temporary, self._server_history_path)
+            os.replace(temporary, path)
         except (OSError, ValueError) as exc:
-            self.api.CON.write(f"Could not save server history: {exc}")
+            self.api.CON.write(f"Could not save {label} history: {exc}")
         finally:
             if temporary is not None:
                 try:
@@ -809,12 +843,7 @@ class ConsoleSession:
                 q.CON.write(f"Alias renamed to {key} due to command/cvar conflict")
 
     def _complete_input(self, context, prefix):
-        q = self.api
-        tokens = context.rsplit(";", 1)[-1].split()
-        mode = q._tabcomp_mode_for_line(tokens)
-        return sorted(q._tabcomp_candidates(prefix, mode=mode,
-                                           first_token=tokens[0] if tokens else None),
-                      key=lambda name: (len(name), name.lower()))
+        return complete_input(self, context, prefix)
 
     def read_line(self, prompt):
         q = self.api
@@ -851,6 +880,7 @@ class ConsoleSession:
 
     async def close(self):
         q = self.api
+        self.cvars.unsubscribe(self._remember_name)
         await self.dispatcher.close()
         await self.disconnect()
         if self.demo is not None:
