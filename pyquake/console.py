@@ -222,10 +222,15 @@ class ConsoleSession:
                 startup = self.dispatcher.current and self.dispatcher.current.source == "startup"
                 await self.connect(args[0], spawn_timeout=30 if startup else 20)
         elif name == "reconnect":
-            await self.connect("last")
+            if self.dispatcher.current and self.dispatcher.current.source == "idle":
+                await q._IDLE_RECONNECT.reconnect(self)
+            else:
+                await self.connect("last")
         elif name == "disconnect":
             await self.disconnect()
             q.CON.write("Disconnected. Use: connect host[:port] or connect last")
+            if self.cvars.get_value("cl_idle", 0) > 0:
+                q.CON.write("cl_idle is enabled and will reconnect automatically. Use cl_idle 0 to stay offline.")
         elif name in ("exec", "execconfig"):
             if len(args) > 1 or (name == "exec" and not args):
                 q.CON.write("usage: exec <filename>")

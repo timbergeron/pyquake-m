@@ -17,6 +17,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         self.console = mock.Mock()
         for name, value in (("cvar_system", self.cvars), ("CURRENT_CLIENT", None),
                             ("_CONSOLE_SESSION", None), ("CON", self.console),
+                            ("_IDLE_RECONNECT", client._IdleReconnectManager()),
                             ("_autosave_config", mock.Mock())):
             patch = mock.patch.object(client, name, value, create=True)
             patch.start()
@@ -543,10 +544,11 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.session.demo_path, self.directory / "pyquake_2.dem")
 
     async def test_idle_reconnect_does_not_queue_during_connection_attempt(self):
-        self.cvars.create("cl_idle", "1", cvar_type=client.CvarType.INT)
+        self.enable_idle()
+        self.active.disconnected = True
         self.session.connecting = True
         manager = client._IdleReconnectManager()
-        with mock.patch.object(client, "Cbuf_AddText") as queue:
+        with mock.patch.object(self.dispatcher, "add_text") as queue:
             running = asyncio.create_task(manager._loop())
             await asyncio.sleep(0)
             queue.assert_not_called()
@@ -565,6 +567,121 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client._IDLE_RECONNECT._last_attempt, last_attempt)
         self.assertTrue(client._IDLE_RECONNECT._saw_dc)
         self.assertIsNone(client.CURRENT_CLIENT)
+
+    def enable_idle(self):
+        client._ensure_cl_idle_cvar()
+        with mock.patch.object(client, "_ensure_idle_reconnect_task"):
+            self.cvars.set("cl_idle", "1")
+        self.session.last_connect_spec = "localhost:26001"
+
+    async def idle_tick(self):
+        with mock.patch.object(client.asyncio, "sleep", side_effect=asyncio.CancelledError):
+            with self.assertRaises(asyncio.CancelledError):
+                await client._IDLE_RECONNECT._loop()
+
+    async def test_queued_idle_retry_is_cancelled_when_disabled(self):
+        self.enable_idle()
+        self.active.disconnected = True
+        waiting, release = asyncio.Event(), asyncio.Event()
+
+        async def wait_frame(count):
+            waiting.set()
+            await release.wait()
+
+        self.dispatcher.wait_frame = wait_frame
+        executing = asyncio.create_task(self.execute("wait; cl_idle 0"))
+        await asyncio.wait_for(waiting.wait(), 1)
+        await self.idle_tick()
+        with mock.patch.object(client.AsyncClient, "connect") as connect:
+            release.set()
+            await asyncio.wait_for(executing, 1)
+        connect.assert_not_called()
+        self.assertFalse(client._IDLE_RECONNECT._pending)
+        self.assertFalse(any("Attempting idle reconnect" in text for text in self.output()))
+
+    async def test_queued_idle_retry_keeps_a_new_connection(self):
+        self.enable_idle()
+        self.active.disconnected = True
+        replacement = client.AsyncClient(FakeConnection())
+        replacement._spawned_fut.set_result(None)
+        self.dispatcher.add_text("connect last")
+        await self.idle_tick()
+
+        async def background(active):
+            await asyncio.Event().wait()
+
+        with mock.patch.object(client.AsyncClient, "connect", return_value=replacement) as connect, \
+                mock.patch.object(client, "_simple_keep_alive", background), \
+                mock.patch.object(client, "_watch_chatinfo", background), \
+                mock.patch.object(client, "_kickstart_handshake", background), \
+                mock.patch.object(client, "_connection_guard", background):
+            await asyncio.wait_for(self.dispatcher.flush(), 1)
+        connect.assert_awaited_once_with("localhost", 26001)
+        self.assertIs(client.CURRENT_CLIENT, replacement)
+        self.assertFalse(replacement._conn.closed)
+        self.assertFalse(client._IDLE_RECONNECT._pending)
+
+    async def test_idle_retry_queues_once_and_times_actual_attempt(self):
+        self.enable_idle()
+        self.active.disconnected = True
+        await self.idle_tick()
+        await self.idle_tick()
+        self.assertEqual(client._IDLE_RECONNECT._last_attempt, 0)
+        before = client.time.monotonic()
+        with mock.patch.object(client.AsyncClient, "connect", side_effect=OSError("unreachable")) as connect:
+            await asyncio.wait_for(self.dispatcher.flush(), 1)
+        connect.assert_awaited_once_with("localhost", 26001)
+        self.assertGreaterEqual(client._IDLE_RECONNECT._last_attempt, before)
+        self.assertFalse(client._IDLE_RECONNECT._pending)
+        self.console.reset_mock()
+        await self.idle_tick()
+        self.assertFalse(client._IDLE_RECONNECT._pending)
+        self.assertEqual(self.output(), [])
+
+    async def test_changing_idle_interval_rearms_retry(self):
+        self.enable_idle()
+        self.active.disconnected = True
+        client._IDLE_RECONNECT._last_attempt = client.time.monotonic()
+        client._IDLE_RECONNECT._saw_dc = True
+        with mock.patch.object(client, "_ensure_idle_reconnect_task") as ensure:
+            await self.execute("cl_idle 2")
+        ensure.assert_called_once()
+        self.assertEqual(client._IDLE_RECONNECT._last_attempt, 0)
+        await self.idle_tick()
+        with mock.patch.object(client.AsyncClient, "connect", side_effect=OSError("unreachable")):
+            await asyncio.wait_for(self.dispatcher.flush(), 1)
+        self.assertIn("Attempting idle reconnect; will retry every 2 minutes.", self.output())
+
+    async def test_idle_retry_waits_for_the_configured_interval(self):
+        self.enable_idle()
+        self.active.disconnected = True
+        with mock.patch.object(client, "_ensure_idle_reconnect_task"):
+            self.cvars.set("cl_idle", "2")
+        manager = client._IDLE_RECONNECT
+        manager._saw_dc = True
+        manager._last_attempt = client.time.monotonic() - 110
+        await self.idle_tick()
+        self.assertFalse(manager._pending)
+        manager._last_attempt = client.time.monotonic() - 130
+        await self.idle_tick()
+        with mock.patch.object(client.AsyncClient, "connect", side_effect=OSError("unreachable")) as connect:
+            await asyncio.wait_for(self.dispatcher.flush(), 1)
+        connect.assert_awaited_once_with("localhost", 26001)
+
+    async def test_idle_without_previous_server_stays_quiet(self):
+        self.enable_idle()
+        self.session.last_connect_spec = None
+        self.active.disconnected = True
+        await self.idle_tick()
+        self.assertFalse(client._IDLE_RECONNECT._pending)
+        self.assertEqual(self.output(), [])
+
+    async def test_disconnect_explains_how_to_disable_idle(self):
+        self.enable_idle()
+        with mock.patch.object(client.AsyncClient, "connect", side_effect=OSError("unreachable")):
+            await asyncio.wait_for(self.execute("disconnect"), 1)
+        self.assertIn("cl_idle is enabled and will reconnect automatically. Use cl_idle 0 to stay offline.",
+                      self.output())
 
     async def test_startup_config_uses_shared_dispatcher_before_connection(self):
         config = self.directory / "startup.cfg"

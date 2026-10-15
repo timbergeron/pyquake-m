@@ -2225,6 +2225,7 @@ def _print_cmdlist():
     print("  connect H[:P]|last  - Connect to host[:port] (default port 26000) or last")
     print("  disconnect          - Disconnect but keep client running")
     print("  reconnect           - Disconnect, then reconnect to the last server")
+    print("  cl_idle 0..60       - Auto-reconnect interval in minutes; 0 disables")
     print("  like                - Say \"likes <last chat>\" (mirrors team/public)")
     print("  tell WHO MSG        - Private msg; WHO may be name, wildcard, or #N")
     print("  clear               - Clear the client console")
@@ -2251,6 +2252,11 @@ def _print_cmdlist():
     print("  infotest            - TEMP: dump a few info keys from server/my/user caches")
 
 # ====================== cl_idle (auto reconnect) =======================
+def _on_cl_idle_changed(cvar: Cvar, old: str, new: str) -> None:
+    _IDLE_RECONNECT.reset_timer()
+    _ensure_idle_reconnect_task()
+
+
 def _ensure_cl_idle_cvar() -> None:
     """
     Register cl_idle if missing.
@@ -2263,9 +2269,10 @@ def _ensure_cl_idle_cvar() -> None:
             cvar_system.register(Cvar(
                 "cl_idle", "0",
                 flags=CvarFlags.ARCHIVE,
+                callback=_on_cl_idle_changed,
                 cvar_type=CvarType.INT,
                 minimum=0, maximum=60,
-                description="When >0, auto-reconnect every N minutes while disconnected (clamped 1–60)."
+                description="Reconnect immediately when disconnected, then every N minutes (1–60); 0 disables."
             ))
     except Exception:
         pass
@@ -2274,18 +2281,20 @@ class _IdleReconnectManager:
     """
     Watches cl_idle and connection state; when disconnected and cl_idle>0,
     attempts an immediate 'reconnect' and then retries every N minutes
-    (N clamped to 1..60). Messages go through CON and commands via Cbuf_AddText.
+    (N clamped to 1..60). Queued retries recheck state before connecting.
     """
     def __init__(self):
         self._task: asyncio.Task | None = None
         self._last_attempt: float = 0.0
         self._saw_dc: bool = False
+        self._pending: bool = False
 
     def ensure_task(self):
         # start the loop once per process on the active asyncio loop
         if self._task and not self._task.done():
             return
         loop = asyncio.get_running_loop()
+        self._pending = False
         self._task = loop.create_task(self._loop(), name="idle-reconnect")
 
     def on_client_changed(self):
@@ -2296,6 +2305,19 @@ class _IdleReconnectManager:
     def reset_timer(self):
         # called when cl_idle changes to re-arm promptly
         self._last_attempt = 0.0
+
+    async def reconnect(self, session):
+        self._pending = False
+        minutes = int(cvar_system.get_value("cl_idle", 0))
+        active = CURRENT_CLIENT
+        if (minutes <= 0 or session.connecting or not session.last_connect_spec
+                or (active is not None and not active.disconnected)):
+            return
+        clamped = max(1, min(60, minutes))
+        unit = "minute" if clamped == 1 else "minutes"
+        CON.write(f"Attempting idle reconnect; will retry every {clamped} {unit}.")
+        self._last_attempt = time.monotonic()
+        await session.connect("last")
 
     async def _loop(self):
         while True:
@@ -2312,7 +2334,7 @@ class _IdleReconnectManager:
                 # disabled; idle a bit
                 self._saw_dc = False
                 self._last_attempt = 0.0
-                await asyncio.sleep(5.0)
+                await asyncio.sleep(1.0)
                 continue
 
             # clamp 1..60 to avoid spam
@@ -2326,14 +2348,11 @@ class _IdleReconnectManager:
                 if not self._saw_dc:
                     self._saw_dc = True
                     self._last_attempt = 0.0
-                if self._last_attempt == 0.0:
-                    CON.write(f"attempting reconnect... will retry every {clamped} {'minute' if clamped==1 else 'minutes'}")
-                    Cbuf_AddText("reconnect\n")
-                    self._last_attempt = now
-                elif (now - self._last_attempt) >= interval:
-                    CON.write(f"idle reconnect triggered after {clamped} {'minute' if clamped==1 else 'minutes'}")
-                    Cbuf_AddText("reconnect\n")
-                    self._last_attempt = now
+                session = _CONSOLE_SESSION
+                if (not self._pending and session is not None and session.last_connect_spec
+                        and (self._last_attempt == 0.0 or now - self._last_attempt >= interval)):
+                    self._pending = True
+                    session.dispatcher.add_text("reconnect", source="idle")
             else:
                 # connected → clear flags so next dc gets an immediate attempt
                 self._saw_dc = False

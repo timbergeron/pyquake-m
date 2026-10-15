@@ -27,6 +27,12 @@ game's demo search path; the corresponding maps and mod assets must be installed
 
 Use `help` in the console to list commands and `quit` to exit. Settings and aliases are saved to `config.cfg` in the current working directory.
 
+`cl_idle N` enables automatic reconnection to the last server: it retries immediately
+when disconnected, then every N minutes (1–60). The setting is saved across restarts;
+changing it rearms the retry timer. `cl_idle 0` disables automatic retries, including
+any waiting in the command queue. Manual `disconnect` also triggers automatic
+reconnection while enabled; use `cl_idle 0; disconnect` to stay offline.
+
 ProQuake connections automatically negotiate 16-bit input angles when supported. For a password-protected server, set the password before connecting; numeric and text passwords are supported:
 
 ```text
