@@ -1274,7 +1274,7 @@ def _split_queued_commands(s: str) -> list[str]:
 
 # Built-in client commands that shouldn't be shadowed; used for conflict rename.
 _RESERVED_CMDS = frozenset({
-    "help","cmdlist","aliaslist","clear","quit","exit","q","scoreboard","extip","disconnect","connect","reconnect","demo","kill","status",
+    "help","cmdlist","aliaslist","clear","quit","exit","q","scoreboard","extip","disconnect","connect","reconnect","demo","record","stop","kill","status",
     "players","showscores","ping","impulse","name","color","say","say_team","tell","dm","pm","like",
     "condump","echo","exec","ip","extip","port","random","cmd","rcon",
     "reset","resetall","resetcfg","s","st","net_stats","unalias","unaliasall","wait",
@@ -2230,7 +2230,8 @@ def _print_cmdlist():
     print("  clear               - Clear the client console")
     print("  condump [file]      - Dump console text to file (default condump.txt)")
     print("  quit                - Disconnect from server")
-    print("  demo                - Start demo recording")
+    print("  demo/record [file]  - Start a demo (default pyquake.dem)")
+    print("  stop                - Stop and save the demo")
     print("  kill                - Suicide")
     print("  status              - Show server status")
     print("  identify [WHO|IP]   - Show locally known player aliases (slots start at 1)")
@@ -2890,6 +2891,10 @@ class Demo:
         self.record_pending = True
 
     def stop_recording(self):
+        if self.recording_started:
+            # QSS-M expects svc_disconnect rather than an abrupt EOF.
+            self._msgs.append(b'\x02')
+            self._angles.append(self._angles[-1])
         self.record_pending = self.recording_started = False
         self.recording_complete = True
 
@@ -2898,16 +2903,12 @@ class Demo:
             if has_server_info:
                 self.record_pending = False
                 self.recording_started = True
-        elif self.recording_started:
-            if has_server_info:
-                self.recording_started = False
-                self.recording_complete = True
         elif self.recording_complete:
             raise Exception("add_message called when recording is complete")
 
         if self.recording_started:
             self._msgs.append(msg)
-            self._angles.append(angles)
+            self._angles.append(tuple(angles))
 
     def _parse_messages(self):
         protocol = proto.Protocol(proto.ProtocolVersion.NETQUAKE, proto.ProtocolFlags(0))
@@ -3111,6 +3112,11 @@ class AsyncClient:
         self._saw_cmd_pext: bool = False
 
         self._demos = []
+        # Keep the current map's sign-on, plus the latest persistent state,
+        # so recording can begin after joining without waiting for a new map.
+        self._demo_signon = []
+        self._demo_signon_complete = False
+        self._demo_state = {}
         # Until we see any real inbound server message (serverinfo/signon/time),
         # we aggressively NAT-punch with small UNRELIABLE packets.
         self._signon_seen = False
@@ -3325,8 +3331,12 @@ class AsyncClient:
 
     def record_demo(self):
         d = Demo()
-        self._demos.append(d)
         d.start_recording()
+        for index, message in enumerate(self._demo_signon):
+            d.add_message(self.angles, message, index == 0)
+        for message in self._demo_state.values():
+            d.add_message(self.angles, message, False)
+        self._demos.append(d)
         return d
 
     def _finish_status(self, success: bool) -> None:
@@ -3369,6 +3379,30 @@ class AsyncClient:
                 if not self._status_waiter.done():
                     self._status_waiter.cancel()
                 self._status_waiter = None
+
+    def _cache_demo_state(self, parsed, raw):
+        kind = parsed.msg_type
+        if kind == proto.ServerMessageType.SERVERINFO:
+            self._demo_signon.clear()
+            self._demo_state.clear()
+            self._demo_signon_complete = False
+        indexed = {
+            proto.ServerMessageType.UPDATENAME: "client_num",
+            proto.ServerMessageType.UPDATEFRAGS: "client_num",
+            proto.ServerMessageType.UPDATECOLORS: "client_num",
+            proto.ServerMessageType.LIGHTSTYLE: "index",
+            proto.ServerMessageType.UPDATESTAT: "index",
+        }
+        if kind in indexed:
+            key = (kind, getattr(parsed, indexed[kind]))
+        elif kind in (proto.ServerMessageType.TIME, proto.ServerMessageType.SETVIEW,
+                      proto.ServerMessageType.SETANGLE, proto.ServerMessageType.SETPAUSE,
+                      proto.ServerMessageType.CDTRACK, proto.ServerMessageType.CLIENTDATA,
+                      proto.ServerMessageType.SKYBOX, proto.ServerMessageType.FOG):
+            key = (kind, None)
+        else:
+            return
+        self._demo_state[key] = raw
 
     def _mono_now(self):
         return time.monotonic() - self._mono0
@@ -3683,7 +3717,7 @@ class AsyncClient:
         zero_baseline = Entity.make_zero_baseline()
 
         while True:
-            remaining_msg = msg = await self._conn.read_message()
+            remaining_msg = msg = wire_msg = await self._conn.read_message()
             # Count inbound packet/frame + bytes
             try:
                 self._net_stats["packets_received"] += 1
@@ -3699,11 +3733,16 @@ class AsyncClient:
 
             has_client_update = False
             has_server_info = False
+            signon_complete = False
             next_entities = {}
             while remaining_msg:
+                unparsed = remaining_msg
                 parsed, remaining_msg = proto.ServerMessage.parse_message(
                     remaining_msg, self.protocol
                 )
+                self._cache_demo_state(parsed, unparsed[:len(unparsed) - len(remaining_msg)])
+                if parsed.msg_type == proto.ServerMessageType.SIGNONNUM and parsed.num >= 3:
+                    signon_complete = True
                 # Any of these means we've definitely got inbound data flowing.
                 if parsed.msg_type in (
                     proto.ServerMessageType.SERVERINFO,
@@ -4228,6 +4267,9 @@ class AsyncClient:
                     self.level_finished = True
 
                 if parsed.msg_type == proto.ServerMessageType.DISCONNECT:
+                    # Preserve the messages preceding this disconnect.
+                    # stop_recording supplies the final marker after capture.
+                    wire_msg = wire_msg[:len(wire_msg) - len(remaining_msg) - 1]
                     self.disconnected = True
                     self._alive = False
                     # Auto-save on server-initiated disconnect
@@ -4236,7 +4278,7 @@ class AsyncClient:
                         try: CON.write("💾 Auto-saved config (disconnect).")
                         except Exception: pass
                     except Exception: pass
-                    return
+                    break
 
             if has_client_update:
                 self.entities = next_entities
@@ -4249,12 +4291,18 @@ class AsyncClient:
             except Exception:
                 pass
 
-            # Only add messages to demo if demo recording is enabled
+            if has_server_info or (self._demo_signon and not self._demo_signon_complete):
+                self._demo_signon.append(bytes(wire_msg))
+            if signon_complete:
+                self._demo_signon_complete = True
+            # Only add messages to demo if demo recording is enabled.
             if hasattr(self, '_demos') and self._demos:
                 self._demos = [d for d in self._demos if not d.recording_complete]
                 for demo in self._demos:
-                    if len(msg) > 0:
-                        demo.add_message(self.angles, msg, has_server_info)
+                    if wire_msg:
+                        demo.add_message(self.angles, wire_msg, has_server_info)
+            if self.disconnected:
+                return
 
     async def wait_for_update(self):
         await asyncio.shield(self._updated_fut)
@@ -4266,6 +4314,8 @@ class AsyncClient:
         return await asyncio.shield(self._center_print_fut)
 
     def _reader_finished(self, task):
+        for demo in self._demos:
+            demo.stop_recording()
         exc = None if task.cancelled() else task.exception()
         if exc is not None:
             logger.warning("Connection closed: %s", exc)

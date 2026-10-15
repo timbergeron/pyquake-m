@@ -68,6 +68,87 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"\x04begin\0", self.conn.sent)
         self.assertFalse(self.client._read_task.done())
 
+    async def test_mid_map_demo_replays_signon_and_current_state(self):
+        baseline = b"\x16" + struct.pack("<HBBBBhBhBhB", 1, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0)
+        await self.receive(b"\x08QSS-M server\n\0" + server_info(666) + b"\x05\x01\0\x19\x01")
+        await self.receive(baseline + b"\x19\x02")
+        await self.receive(b"\x0d\x00old\0\x19\x03")
+        await self.receive(b"\x0d\x00current\0\x0e\0\x05\0\x0c\0abc\0"
+                           + b"\x07" + struct.pack("<f", 120))
+        demo = self.client.record_demo()
+        self.assertTrue(demo.recording_started)
+        await self.receive(b"\x08still recording\n\0" + client_data() + b"\x82\x01\x10\0")
+        await self.client.disconnect()
+        self.assertTrue(demo.recording_complete)
+        output = io.BytesIO()
+        demo.dump(output)
+        output.seek(0)
+        messages = [entry[2] for entry in proto.read_demo_file(output)]
+        kinds = [message.msg_type for message in messages]
+        self.assertEqual(kinds[:2], [proto.ServerMessageType.PRINT, proto.ServerMessageType.SERVERINFO])
+        self.assertIn(proto.ServerMessageType.SPAWNBASELINE, kinds)
+        self.assertEqual([m.num for m in messages if m.msg_type == proto.ServerMessageType.SIGNONNUM], [1, 2, 3])
+        self.assertEqual([m.name for m in messages if m.msg_type == proto.ServerMessageType.UPDATENAME][-1], "current")
+        self.assertEqual([m.time for m in messages if m.msg_type == proto.ServerMessageType.TIME][-1], 120)
+        self.assertIn("still recording\n", [m.string for m in messages
+                                           if m.msg_type == proto.ServerMessageType.PRINT])
+        self.assertEqual(kinds[-1], proto.ServerMessageType.DISCONNECT)
+
+    async def test_demo_cache_resets_on_map_change_and_active_demo_continues(self):
+        await self.receive(server_info(level=b"old") + b"\x19\x03")
+        first = self.client.record_demo()
+        await self.receive(server_info(level=b"new") + b"\x19\x03")
+        second = self.client.record_demo()
+        for demo, levels in ((first, ["old", "new"]), (second, ["new"])):
+            demo.stop_recording()
+            output = io.BytesIO()
+            demo.dump(output)
+            output.seek(0)
+            self.assertEqual([m.level_name for _, _, m in proto.read_demo_file(output)
+                              if m.msg_type == proto.ServerMessageType.SERVERINFO], levels)
+
+    async def test_demo_started_before_signon_records_and_stops_once(self):
+        demo = self.client.record_demo()
+        await self.receive(b"\x08negotiating\0")
+        self.assertFalse(demo._msgs)
+        await self.receive(server_info() + b"\x19\x03")
+        demo.stop_recording()
+        demo.stop_recording()
+        self.assertEqual(demo._msgs[-1], b"\x02")
+        self.assertEqual(demo._msgs.count(b"\x02"), 1)
+        await self.receive(b"\x01")
+        self.assertFalse(self.client._read_task.done())
+
+    async def test_demo_preserves_final_server_packet_before_disconnect(self):
+        demo = self.client.record_demo()
+        await self.receive(server_info() + b"\x19\x03")
+        self.conn.incoming.put_nowait(b"\x08final match statistics\n\0\x02")
+        await self.client._read_task
+        await asyncio.sleep(0)
+        output = io.BytesIO()
+        demo.dump(output)
+        output.seek(0)
+        messages = [m for _, _, m in proto.read_demo_file(output)]
+        self.assertTrue(demo.recording_complete)
+        self.assertEqual(messages[-2].string, "final match statistics\n")
+        self.assertEqual(messages[-1].msg_type, proto.ServerMessageType.DISCONNECT)
+        self.assertEqual(sum(m.msg_type == proto.ServerMessageType.DISCONNECT for m in messages), 1)
+
+    async def test_demo_cache_does_not_retain_gameplay_history(self):
+        await self.receive(server_info() + b"\x19\x03")
+        signon = list(self.client._demo_signon)
+        for frame in range(100):
+            await self.receive(b"\x07" + struct.pack("<f", frame))
+        self.assertEqual(self.client._demo_signon, signon)
+        self.assertEqual(len(self.client._demo_state), 1)
+        demo = self.client.record_demo()
+        demo.stop_recording()
+        output = io.BytesIO()
+        demo.dump(output)
+        output.seek(0)
+        self.assertEqual([m.time for _, _, m in proto.read_demo_file(output)
+                          if m.msg_type == proto.ServerMessageType.TIME], [99])
+
     async def test_update_wait_survives_timeout(self):
         with self.assertRaises(asyncio.TimeoutError):
             await asyncio.wait_for(self.client.wait_for_update(), 0.001)

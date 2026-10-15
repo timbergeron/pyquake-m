@@ -10,12 +10,20 @@ python3 -m pyquake.client denver.quakeone.com 26000
 
 The port defaults to 26000 when omitted. Use `python` or `py` in place of `python3` on Windows. Direct invocation also works: `python3 pyquake/client.py localhost 26000`.
 
-Record a demo with `--demo` (saved as `pyquake.dem` on exit), or check a server handshake with `test`:
+Record a demo with `--demo` (saved as `pyquake.dem` when stopped or disconnected), or check a server handshake with `test`:
 
 ```bash
 python3 -m pyquake.client --demo localhost 26000
 python3 -m pyquake.client test localhost 26000
 ```
+
+While connected, use `record match` (or `demo match`) to start recording to
+`match.dem`, then `stop` to save it. The filename is optional and defaults to
+`pyquake.dem`; quote filenames containing spaces. Recording can start mid-map
+and continues across map changes. Disconnecting or quitting also saves it.
+With `--demo`, reconnecting starts a new file (`pyquake_2.dem`, and so on).
+Play the saved file in QSS-M with `playdemo match` after copying it into the
+game's demo search path; the corresponding maps and mod assets must be installed.
 
 Use `help` in the console to list commands and `quit` to exit. Settings and aliases are saved to `config.cfg` in the current working directory.
 

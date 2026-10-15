@@ -3,9 +3,11 @@
 import asyncio
 import fnmatch
 import inspect
+import os
 from pathlib import Path
 import re
 import shlex
+import tempfile
 import time
 
 if __package__:
@@ -31,7 +33,10 @@ class ConsoleSession:
         self.last_connect_spec = None
         self.tasks = ()
         self.demo = None
+        self.demo_path = Path("pyquake.dem")
+        self._demo_reader = None
         self.enable_demo = False
+        self._auto_demo_count = 0
         self.connecting = False
         self.iplog = IpLog(Path(self.cvars._config_file).expanduser().resolve().parent / "iplog.dat")
         try:
@@ -92,8 +97,55 @@ class ConsoleSession:
         self.tasks = ()
         old = self.client
         q._set_current_client(None, reset_idle=not self.connecting)
+        if self._demo_reader is not None:
+            self._demo_reader.remove_done_callback(self._demo_reader_finished)
+            self._demo_reader = None
         if old is not None:
             await old.disconnect()
+        self.stop_demo()
+
+    def _start_demo(self, active):
+        self.demo = active.record_demo()
+        reader = active._read_task
+        if reader is not None and reader is not self._demo_reader:
+            self._demo_reader = reader
+            reader.add_done_callback(self._demo_reader_finished)
+
+    def _demo_reader_finished(self, task):
+        if task is self._demo_reader:
+            self._demo_reader = None
+            self.stop_demo()
+
+    def stop_demo(self):
+        if self.demo is None:
+            return False
+        self.demo.stop_recording()
+        if not self.demo._msgs:
+            self.api.CON.write("No demo data received; no file saved.")
+            self.demo = None
+            return True
+        temporary = None
+        try:
+            # Publish only a complete file, keeping any previous demo intact
+            # if writing or closing the replacement fails.
+            with tempfile.NamedTemporaryFile(mode="wb", dir=self.demo_path.parent,
+                                             prefix=".pyquake-demo-",
+                                             suffix=".tmp", delete=False) as output:
+                temporary = Path(output.name)
+                self.demo.dump(output)
+            os.replace(temporary, self.demo_path)
+        except OSError as exc:
+            self.api.CON.write(f"Could not save demo to {self.demo_path}: {exc}. Use stop to retry.")
+            return False
+        finally:
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        self.api.CON.write(f"Demo saved to {self.demo_path}")
+        self.demo = None
+        return True
 
     async def connect(self, spec, *, spawn_timeout=20):
         if self.connecting:
@@ -125,7 +177,10 @@ class ConsoleSession:
         active._bind_cvar_subscriptions()
         q._set_current_client(active)
         if self.enable_demo and self.demo is None:
-            self.demo = active.record_demo()
+            self._auto_demo_count += 1
+            suffix = "" if self._auto_demo_count == 1 else f"_{self._auto_demo_count}"
+            self.demo_path = Path(f"pyquake{suffix}.dem")
+            self._start_demo(active)
         self.tasks = tuple(asyncio.create_task(fn(active)) for fn in (
             q._simple_keep_alive, q._watch_chatinfo, q._kickstart_handshake, q._connection_guard))
         try:
@@ -205,14 +260,27 @@ class ConsoleSession:
                 q.CON.dump(args[0] if args else "condump.txt")
         elif name in ("identify", "ipdump", "ipmerge", "ipnames"):
             await self._identity_command(name, args)
-        elif name == "demo":
+        elif name in ("demo", "record"):
+            if len(args) > 1:
+                q.CON.write("Usage: record [filename]")
+                return True
             if self.demo is not None:
-                q.CON.write("Demo already recording")
+                q.CON.write("A demo is already pending; use stop to save it first.")
             elif self.client is not None and not self.client.disconnected:
-                self.demo = self.client.record_demo()
+                self.demo_path = Path(args[0] if args else "pyquake.dem")
+                if self.demo_path.suffix.lower() != ".dem":
+                    self.demo_path = Path(str(self.demo_path) + ".dem")
+                self._start_demo(self.client)
                 q.CON.write("Demo recording started")
             else:
                 q.CON.write("Not connected.")
+        elif name == "stop":
+            if args:
+                q.CON.write("Usage: stop")
+            elif self.demo is None:
+                q.CON.write("Not recording a demo.")
+            else:
+                self.stop_demo()
         elif name in ("showscores", "scoreboard"):
             if self.client is None or self.client.disconnected:
                 q.CON.write("Not connected.")
@@ -472,11 +540,6 @@ class ConsoleSession:
         except (OSError, ValueError) as exc:
             q.CON.write(f"Could not save IP history: {exc}")
         await q._stop_tasks(q._IDLE_RECONNECT._task)
-        if self.demo is not None:
-            self.demo.stop_recording()
-            with open("pyquake.dem", "wb") as output:
-                self.demo.dump(output)
-            q.CON.write("Demo saved to pyquake.dem")
 
     async def showscores(self):
         q = self.api

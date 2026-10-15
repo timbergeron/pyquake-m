@@ -4,10 +4,11 @@ import tempfile
 import unittest
 from unittest import mock
 
-from pyquake import client
+from pyquake import client, proto
 from pyquake.commands import quote_arg, split_commands
 from pyquake.console import ConsoleSession
 from test_client import FakeConnection
+from test_proto import server_info
 
 
 class CommandTests(unittest.IsolatedAsyncioTestCase):
@@ -46,6 +47,123 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         await self.execute("ready; observe; custom_mod_command arg")
         self.assertEqual(self.messages(), ["ready", "observe", "custom_mod_command arg"])
         self.assertEqual(self.cvars.get_value("cl_chatmode"), 0)
+
+    async def test_demo_commands_save_named_file_and_can_record_again(self):
+        path = self.directory / "match recording"
+        await self.execute("cl_chatmode 1")
+        await self.execute(f"record {quote_arg(path)}")
+        self.session.demo.add_message((0, 0, 0), server_info(), True)
+        await self.execute("stop")
+        self.assertIsNone(self.session.demo)
+        self.assertTrue(Path(str(path) + ".dem").read_bytes().endswith(b"\x02"))
+        self.assertEqual(self.messages(), [])
+        await self.execute(f"demo {quote_arg(self.directory / 'second.dem')}")
+        self.session.demo.add_message((0, 0, 0), server_info(), True)
+        await self.session.disconnect()
+        self.assertIsNone(self.session.demo)
+        self.assertTrue((self.directory / "second.dem").is_file())
+
+    async def test_empty_demo_does_not_replace_existing_file(self):
+        path = self.directory / "existing.dem"
+        path.write_bytes(b"existing recording")
+        await self.execute(f"record {quote_arg(path)}; stop")
+        self.assertEqual(path.read_bytes(), b"existing recording")
+        self.assertIsNone(self.session.demo)
+
+    async def test_demo_save_failure_preserves_recording_for_retry(self):
+        path = self.directory / "missing" / "match.dem"
+        await self.execute(f"record {quote_arg(path)}")
+        self.session.demo.add_message((0, 0, 0), server_info(), True)
+        await self.execute("stop")
+        self.assertIsNotNone(self.session.demo)
+        self.assertTrue(any("Could not save demo" in line for line in self.output()))
+        path.parent.mkdir()
+        await self.execute("stop")
+        self.assertIsNone(self.session.demo)
+        self.assertTrue(path.read_bytes().endswith(b"\x02"))
+
+    async def test_interrupted_demo_save_keeps_existing_file_and_allows_retry(self):
+        path = self.directory / "match.dem"
+        path.write_bytes(b"previous recording")
+        await self.execute(f"record {quote_arg(path)}")
+        demo = self.session.demo
+        demo.add_message((0, 0, 0), server_info(), True)
+
+        def failed_write(output):
+            output.write(b"partial data")
+            raise OSError("disk full")
+
+        with mock.patch.object(demo, "dump", side_effect=failed_write):
+            await self.execute("stop")
+        self.assertIs(self.session.demo, demo)
+        self.assertEqual(path.read_bytes(), b"previous recording")
+        self.assertEqual(list(self.directory.iterdir()), [path])
+        await self.execute("stop")
+        self.assertIsNone(self.session.demo)
+        with path.open("rb") as stream:
+            messages = list(proto.read_demo_file(stream))
+        self.assertEqual(messages[-1][2].msg_type, proto.ServerMessageType.DISCONNECT)
+
+    async def test_server_disconnect_saves_demo_without_console_input(self):
+        path = self.directory / "server-ended.dem"
+        self.active._read_task = asyncio.create_task(self.active._read_messages())
+        self.active._read_task.add_done_callback(self.active._reader_finished)
+        await self.execute(f"record {quote_arg(path)}")
+        self.conn.incoming.put_nowait(server_info() + b"\x19\x03\x02")
+        await self.active._read_task
+        await asyncio.sleep(0)
+        self.assertIsNone(self.session.demo)
+        with path.open("rb") as stream:
+            messages = list(proto.read_demo_file(stream))
+        self.assertEqual(messages[-1][2].msg_type, proto.ServerMessageType.DISCONNECT)
+
+    async def test_demo_replace_failure_keeps_old_file_and_removes_temporary_file(self):
+        path = self.directory / "match.dem"
+        path.write_bytes(b"previous recording")
+        await self.execute(f"record {quote_arg(path)}")
+        self.session.demo.add_message((0, 0, 0), server_info(), True)
+        with mock.patch("pyquake.console.os.replace", side_effect=PermissionError("file in use")):
+            await self.execute("stop")
+        self.assertEqual(path.read_bytes(), b"previous recording")
+        self.assertEqual(list(self.directory.iterdir()), [path])
+        self.assertIsNotNone(self.session.demo)
+        await self.execute("stop")
+        self.assertIsNone(self.session.demo)
+
+    async def test_repeated_recordings_save_current_demo_when_reader_fails(self):
+        self.active._read_task = asyncio.create_task(self.active._read_messages())
+        self.active._read_task.add_done_callback(self.active._reader_finished)
+        first = self.directory / "first.dem"
+        second = self.directory / "second.dem"
+        await self.execute(f"record {quote_arg(first)}")
+        self.session.demo.add_message((0, 0, 0), server_info(), True)
+        await self.execute(f"stop; record {quote_arg(second)}")
+        self.session.demo.add_message((0, 0, 0), server_info(), True)
+        with self.assertLogs(level="WARNING"):
+            self.conn.incoming.put_nowait(b"\x07")
+            await asyncio.gather(self.active._read_task, return_exceptions=True)
+            await asyncio.sleep(0)
+        self.assertIsNone(self.session.demo)
+        self.assertEqual(sum("Demo saved" in line for line in self.output()), 2)
+        for path in (first, second):
+            with path.open("rb") as stream:
+                messages = list(proto.read_demo_file(stream))
+            self.assertEqual(messages[-1][2].msg_type, proto.ServerMessageType.DISCONNECT)
+
+    async def test_disconnect_attempts_demo_save_once_and_keeps_failed_recording(self):
+        self.active._read_task = asyncio.create_task(self.active._read_messages())
+        self.active._read_task.add_done_callback(self.active._reader_finished)
+        path = self.directory / "match.dem"
+        await self.execute(f"record {quote_arg(path)}")
+        self.session.demo.add_message((0, 0, 0), server_info(), True)
+        with mock.patch("pyquake.console.os.replace", side_effect=OSError("disk full")) as replace:
+            await self.execute("disconnect")
+        replace.assert_called_once()
+        self.assertIsNotNone(self.session.demo)
+        self.assertFalse(path.exists())
+        await self.execute("stop")
+        self.assertIsNone(self.session.demo)
+        self.assertTrue(path.is_file())
 
     async def test_auto_chat_keeps_commands_cvars_and_aliases(self):
         await self.execute('cl_chatmode 1; seta greeting hello; alias go "ready"')
@@ -351,6 +469,33 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(client.CURRENT_CLIENT, replacement)
         self.assertIs(replacement.aliases, self.session.aliases)
         self.assertIn(b"\x04ready\0", replacement._conn.sent)
+
+    async def test_auto_demo_reconnect_saves_old_recording_and_starts_new_file(self):
+        self.session.last_connect_spec = "localhost:26001"
+        self.session.enable_demo = True
+        first = client.AsyncClient(FakeConnection())
+        second = client.AsyncClient(FakeConnection())
+        for active in (first, second):
+            active._spawned_fut.set_result(None)
+
+        async def background(active):
+            await asyncio.Event().wait()
+
+        with mock.patch.object(client.AsyncClient, "connect", side_effect=[first, second]), \
+                mock.patch.object(client, "_simple_keep_alive", background), \
+                mock.patch.object(client, "_watch_chatinfo", background), \
+                mock.patch.object(client, "_kickstart_handshake", background), \
+                mock.patch.object(client, "_connection_guard", background), \
+                mock.patch("pyquake.console.Path", side_effect=lambda name: self.directory / name):
+            await self.execute("reconnect")
+            old = self.session.demo
+            old.add_message((0, 0, 0), server_info(), True)
+            await self.execute("reconnect")
+            self.assertTrue(old.recording_complete)
+            self.assertTrue((self.directory / "pyquake.dem").is_file())
+            self.assertIsNot(self.session.demo, old)
+            self.assertIn(self.session.demo, second._demos)
+            self.assertEqual(self.session.demo_path, self.directory / "pyquake_2.dem")
 
     async def test_idle_reconnect_does_not_queue_during_connection_attempt(self):
         self.cvars.create("cl_idle", "1", cvar_type=client.CvarType.INT)
